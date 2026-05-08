@@ -1,0 +1,19 @@
+{
+  "name": "shopify-meta-capi",
+  "version": "1.0.0",
+  "description": "Shopify webhook to Meta CAPI forwarding service",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pino": "^9.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "UNLICENSED"
+}
