@@ -25,8 +25,10 @@ router.post('/:clientSlug/order-paid', (req, res) => {
   res.status(200).end()
 
   const order = req.body
-  const orderId = String(order.id)
-  const eventId = 'shopify_' + order.id
+  const orderId = order.admin_graphql_api_id
+    ? order.admin_graphql_api_id.split('/').pop()
+    : String(order.id)
+  const eventId = 'shopify_' + orderId
 
   const logger = req.log.child({
     client: clientSlug,
