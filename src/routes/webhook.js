@@ -30,17 +30,21 @@ router.post('/:clientSlug/order-paid', (req, res) => {
     : String(order.id)
   const eventId = 'shopify_' + orderId
 
+  const ordersCount = order.customer?.orders_count
+  const customerType = ordersCount > 1 ? 'returning' : 'new'
+
   const logger = req.log.child({
     client: clientSlug,
     orderId,
   })
 
   logger.info({
-    orderTotal: order.total_price,
-    currency:   order.currency,
-    customerIp: order.browser_ip,
-    userAgent:  order.client_details?.user_agent,
+    orderTotal:   order.total_price,
+    currency:     order.currency,
+    customerIp:   order.browser_ip,
+    userAgent:    order.client_details?.user_agent,
     eventId,
+    customerType,
   }, 'Order received')
 
   ;(async () => {
