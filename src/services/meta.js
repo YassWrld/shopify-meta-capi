@@ -1,4 +1,4 @@
-const { hashEmail, hashPhone, hashName, hashCity, hashZip, hashCountry } = require('./hash')
+const { hashEmail, hashPhone, hashName, hashCity, hashZip, hashCountry, hashState } = require('./hash')
 
 async function sendPurchaseEvent(order, clientConfig, logger) {
   const billing = order.billing_address || {}
@@ -18,6 +18,7 @@ async function sendPurchaseEvent(order, clientConfig, logger) {
     ct:                hashCity(billing.city),
     zp:                hashZip(billing.zip),
     country:           hashCountry(billing.country_code),
+    st:                hashState(billing.province_code),
     client_ip_address: order.browser_ip || undefined,
     client_user_agent: order.client_details?.user_agent || undefined,
   }

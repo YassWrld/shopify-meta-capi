@@ -35,6 +35,11 @@ function normalizeCountry(value) {
   return value.toLowerCase().trim()
 }
 
+function normalizeState(value) {
+  if (value === null || value === undefined || value === '') return null
+  return value.toLowerCase().trim()
+}
+
 module.exports = {
   hashEmail:   (v) => { const n = normalizeEmail(v);   return n ? hashField(n) : null },
   hashPhone:   (v) => { const n = normalizePhone(v);   return n ? hashField(n) : null },
@@ -42,4 +47,5 @@ module.exports = {
   hashCity:    (v) => { const n = normalizeCity(v);    return n ? hashField(n) : null },
   hashZip:     (v) => { const n = normalizeZip(v);     return n ? hashField(n) : null },
   hashCountry: (v) => { const n = normalizeCountry(v); return n ? hashField(n) : null },
+  hashState:   (v) => { const n = normalizeState(v);   return n ? hashField(n) : null },
 }

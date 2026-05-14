@@ -4,9 +4,13 @@
 
 This document covers the minimal implementation required to prove that a Shopify store's paid orders can be reliably forwarded to Meta's Conversions API server-side, bypassing all the browser-level loss (iOS 14, ad blockers, cookie consent, page abandonment) that causes the ~50% discrepancy between Shopify order counts and Meta-reported conversions.
 
-**This is not an MVP.** There is no database, no dashboard, no multi-platform support, no customer storage. It is a single Node.js service that receives a Shopify webhook, verifies it, and forwards a `Purchase` event to Meta CAPI. Its sole purpose is to validate the pipeline end-to-end with a real store and a real Meta pixel before any architectural decisions are locked in for the full product.
+**This is not an MVP.** There is no database, no dashboard, no multi-platform support, no customer storage. It is a single Node.js service that receives a Shopify webhook, verifies it, and forwards two CAPI events to Meta per order. Its sole purpose is to validate the pipeline end-to-end with a real store and a real Meta pixel before any architectural decisions are locked in for the full product.
 
-**What success looks like:** A paid Shopify order appears as a `Purchase` event in Meta Events Manager within seconds, with correct value, currency, and hashed user data, deduplicated against the browser pixel so Meta counts it once.
+**What success looks like:** A paid Shopify order triggers two events in Meta Events Manager within seconds:
+- A standard `Purchase` event — deduplicated against the browser pixel, used by Meta's algorithm for optimization
+- A `NewCustomerPurchase` or `ReturningCustomerPurchase` custom event — used for segmented reporting and audience building
+
+Both events carry correct value, currency, and hashed user data.
 
 ---
 
@@ -27,15 +31,15 @@ This POC targets a single client. A section at the end of this document covers w
 
 ## 3. Tech Stack
 
-| Layer | Choice | Notes |
-|---|---|---|
-| Runtime | **Node.js** | Consistent with existing VPS deployments |
-| Framework | **Express.js** | No overhead — this is a single webhook endpoint |
-| Config | **dotenv** | All secrets via `.env`, never hardcoded |
-| Logging | **Pino** | Structured JSON logs, fast, easy to grep by field |
-| HTTP client | **Native fetch** (Node 18+) | No dependency needed for one API call |
-| Process manager | **PM2** | Consistent with existing deployments |
-| Reverse proxy | **Nginx** | Consistent with existing deployments |
+| Layer           | Choice                      | Notes                                             |
+| --------------- | --------------------------- | ------------------------------------------------- |
+| Runtime         | **Node.js**                 | Consistent with existing VPS deployments          |
+| Framework       | **Express.js**              | No overhead — this is a single webhook endpoint   |
+| Config          | **dotenv**                  | All secrets via `.env`, never hardcoded           |
+| Logging         | **Pino**                    | Structured JSON logs, fast, easy to grep by field |
+| HTTP client     | **Native fetch** (Node 18+) | No dependency needed for one API call             |
+| Process manager | **PM2**                     | Consistent with existing deployments              |
+| Reverse proxy   | **Nginx**                   | Consistent with existing deployments              |
 
 No database. No ORM. No queue. No authentication layer. Those belong in the full product, not this POC.
 
@@ -51,7 +55,7 @@ shopify-meta-capi/
 │   │   └── webhook.js               # POST /webhooks/:clientSlug/order-paid
 │   ├── services/
 │   │   ├── shopify.js               # HMAC-SHA256 signature verification
-│   │   ├── meta.js                  # CAPI payload construction + HTTP call
+│   │   ├── meta.js                  # CAPI payload construction + HTTP calls (two events)
 │   │   └── hash.js                  # SHA-256 normalization and hashing of PII fields
 │   └── middleware/
 │       └── rawBody.js               # Captures raw body buffer before JSON parsing
@@ -87,13 +91,40 @@ META_TEST_EVENT_CODE=TEST12345        # Leave empty in production
 STORE_URL=https://client-store.myshopify.com
 ```
 
-For the POC, a single client's credentials live directly in `.env`. When scaling to multiple clients, `config/clients.js` is extended — covered in Section 10.
+For the POC, a single client's credentials live directly in `.env`. When scaling to multiple clients, `config/clients.js` is extended — covered in Section 12.
 
 ---
 
-## 6. Module Specifications
+## 6. Dual Event Strategy
 
-### 6.1 `src/middleware/rawBody.js`
+For every paid Shopify order, the service fires **two separate CAPI events** to Meta:
+
+### Event 1 — Standard `Purchase`
+The standard Meta event used by Meta's algorithm for campaign optimization, value-based bidding, and ROAS reporting. This is what Meta's ad delivery algorithm reads to optimize campaigns. Deduplicated against the browser pixel via `event_id`.
+
+### Event 2 — `NewCustomerPurchase` or `ReturningCustomerPurchase`
+A custom event used purely for segmentation and reporting. Determined by `order.customer.orders_count` from the Shopify webhook payload:
+- `orders_count === 1` → `NewCustomerPurchase` (this is their first ever order)
+- `orders_count > 1` → `ReturningCustomerPurchase`
+
+### Why both and not just the custom event
+
+Meta's optimization algorithm is trained on the standard `Purchase` event. Replacing it with a custom event name degrades campaign performance — Meta loses years of optimization signal. The custom event runs alongside `Purchase`, never instead of it.
+
+### What this enables for marketers
+
+| Capability                                             | How                                                                             |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| Separate reporting per customer type                   | Custom Conversions based on `NewCustomerPurchase` / `ReturningCustomerPurchase` |
+| Exclude returning customers from acquisition campaigns | Audience from `ReturningCustomerPurchase` → exclusion list                      |
+| Retarget returning customers separately                | Audience from `ReturningCustomerPurchase` → dedicated retargeting campaign      |
+| New customer ROAS vs returning customer ROAS           | Two custom conversion columns in Ads Manager                                    |
+
+---
+
+## 7. Module Specifications
+
+### 7.1 `src/middleware/rawBody.js`
 
 **Purpose:** Express automatically parses the JSON request body and discards the raw bytes. Shopify computes the webhook signature against the exact raw bytes of the body — not the parsed object. Without the raw body, signature verification is impossible.
 
@@ -105,11 +136,11 @@ For the POC, a single client's credentials live directly in `.env`. When scaling
 
 **Applied to:** All routes globally on app startup. Must be registered before `express.json()`.
 
-**Critical note:** This middleware must use `verify` option of `express.json()` rather than being a separate middleware, to guarantee the raw body is captured on the same pass as parsing. Both patterns work — the `verify` callback approach is slightly cleaner.
+**Critical note:** This middleware must use the `verify` option of `express.json()` rather than being a separate middleware, to guarantee the raw body is captured on the same pass as parsing.
 
 ---
 
-### 6.2 `src/services/shopify.js`
+### 7.2 `src/services/shopify.js`
 
 **Purpose:** Verify that an incoming webhook request genuinely originates from Shopify and has not been tampered with.
 
@@ -127,7 +158,7 @@ For the POC, a single client's credentials live directly in `.env`. When scaling
 
 ---
 
-### 6.3 `src/services/hash.js`
+### 7.3 `src/services/hash.js`
 
 **Purpose:** Meta requires all PII fields in `user_data` to be SHA-256 hashed before transmission. Raw PII must never leave your server.
 
@@ -135,14 +166,14 @@ For the POC, a single client's credentials live directly in `.env`. When scaling
 
 **Normalization rules applied before hashing (Meta's spec):**
 
-| Field | Normalization |
-|---|---|
-| Email | Lowercase, trim whitespace |
-| Phone | Strip all non-digit characters, prepend country code without `+` (e.g. `+33 6 12 34 56 78` → `33612345678`) |
-| First / last name | Lowercase, trim whitespace |
-| City | Lowercase, trim whitespace |
-| Zip code | Lowercase, trim whitespace, remove spaces |
-| Country | 2-letter ISO code, lowercase (e.g. `fr`, `us`, `dz`) |
+| Field             | Normalization                                                                                               |
+| ----------------- | ----------------------------------------------------------------------------------------------------------- |
+| Email             | Lowercase, trim whitespace                                                                                  |
+| Phone             | Strip all non-digit characters, prepend country code without `+` (e.g. `+33 6 12 34 56 78` → `33612345678`) |
+| First / last name | Lowercase, trim whitespace                                                                                  |
+| City              | Lowercase, trim whitespace                                                                                  |
+| Zip code          | Lowercase, trim whitespace, remove spaces                                                                   |
+| Country           | 2-letter ISO code, lowercase (e.g. `fr`, `us`, `dz`)                                                        |
 
 **Hash algorithm:** SHA-256, hex digest (not base64).
 
@@ -150,60 +181,100 @@ For the POC, a single client's credentials live directly in `.env`. When scaling
 
 ---
 
-### 6.4 `src/services/meta.js`
+### 7.4 `src/services/meta.js`
 
-**Purpose:** Construct the CAPI event payload from a Shopify order object and the client config, then send it to Meta's Graph API.
+**Purpose:** Construct and send two CAPI events to Meta's Graph API for every Shopify order — one standard `Purchase` and one customer-type custom event.
 
 **Exported function:** `sendPurchaseEvent(order, clientConfig)`
 
-**Payload construction:**
-
+**Customer type determination:**
 ```
-{
-  data: [{
-    event_name:       "Purchase"
-    event_time:       Unix timestamp — Math.floor(new Date(order.created_at) / 1000)
-    event_id:         "shopify_" + order.id           ← deduplication key
-    action_source:    "website"
-    event_source_url: clientConfig.storeUrl
+order.customer.orders_count === 1  →  customEventName = "NewCustomerPurchase"
+order.customer.orders_count > 1   →  customEventName = "ReturningCustomerPurchase"
+order.customer is null/missing    →  customEventName = "NewCustomerPurchase" (safe default)
+```
 
-    user_data: {
-      em:                   hash(order.email)
-      ph:                   hash(order.billing_address.phone || order.phone)
-      fn:                   hash(order.billing_address.first_name)
-      ln:                   hash(order.billing_address.last_name)
-      ct:                   hash(order.billing_address.city)
-      zp:                   hash(order.billing_address.zip)
-      country:              hash(order.billing_address.country_code.toLowerCase())
-      client_ip_address:    order.browser_ip                ← not hashed
-      client_user_agent:    order.client_details?.user_agent ← not hashed
-    }
+**Order ID extraction:** Shopify order IDs can exceed JavaScript's `Number.MAX_SAFE_INTEGER`. Parsing the JSON body as a number loses precision, which breaks the `event_id` deduplication match with the browser pixel. Always extract the order ID as a string from `order.admin_graphql_api_id`:
+```
+orderId = order.admin_graphql_api_id.split('/').pop()
+// "gid://shopify/Order/820982911946154508" → "820982911946154508"
+// Fallback: String(order.id) if admin_graphql_api_id is absent
+```
 
-    custom_data: {
-      currency:  order.currency
-      value:     parseFloat(order.total_price)
-      order_id:  String(order.id)
-    }
-  }]
-
-  test_event_code: clientConfig.testEventCode   ← only if non-empty string
+**Shared user_data block** — built once, used in both events:
+```
+user_data: {
+  em:                   hash(order.email || order.contact_email)  ← contact_email fallback for guest checkouts
+  ph:                   hash(order.billing_address.phone || order.phone)
+  fn:                   hash(order.billing_address.first_name)
+  ln:                   hash(order.billing_address.last_name)
+  ct:                   hash(order.billing_address.city)
+  st:                   hash(order.billing_address.province_code)  ← state/province, lowercase
+  zp:                   hash(order.billing_address.zip)
+  country:              hash(order.billing_address.country_code.toLowerCase())
+  client_ip_address:    order.browser_ip                 ← not hashed
+  client_user_agent:    order.client_details?.user_agent ← not hashed
 }
 ```
 
-**Endpoint:** `POST https://graph.facebook.com/v19.0/{pixelId}/events`
+**Event 1 payload — standard Purchase:**
+```
+{
+  event_name:       "Purchase"
+  event_time:       Math.floor(new Date(order.created_at) / 1000)
+  event_id:         "shopify_" + orderId        ← deduplication key with browser pixel
+  action_source:    "website"
+  event_source_url: clientConfig.storeUrl
+  user_data:        <shared block above>
+  custom_data: {
+    currency:     order.currency
+    value:        parseFloat(order.total_price)
+    order_id:     orderId
+    new_customer: isNewCustomer   ← Meta's native boolean field
+  }
+}
+```
 
-**Authentication:** Access token passed as query parameter `access_token={capiToken}` (Meta's CAPI does not use Authorization header — it uses query param or body field).
+**Event 2 payload — custom customer type event:**
+```
+{
+  event_name:       "NewCustomerPurchase" | "ReturningCustomerPurchase"
+  event_time:       Math.floor(new Date(order.created_at) / 1000)
+  event_id:         "shopify_custom_" + orderId   ← different event_id, not deduplicated
+  action_source:    "website"
+  event_source_url: clientConfig.storeUrl
+  user_data:        <same shared block>
+  custom_data: {
+    currency:  order.currency
+    value:     parseFloat(order.total_price)
+    order_id:  orderId
+  }
+}
+```
+
+**Both events are sent in a single API call** — Meta's CAPI endpoint accepts an array of up to 1000 events per request. Send them together in the `data` array rather than two separate HTTP calls:
+
+```
+POST https://graph.facebook.com/v19.0/{pixelId}/events
+body: {
+  data: [ event1_Purchase, event2_CustomerType ],
+  access_token: capiToken,
+  test_event_code: ...   ← only if non-empty
+}
+```
+
+**Authentication:** Access token passed as body field or query parameter `access_token={capiToken}`.
 
 **Response handling:**
 - Log the full response body regardless of status
 - On HTTP 4xx/5xx, log the error detail from Meta's response (`error.message`, `error.code`)
-- Do not throw — a failed CAPI call should not crash the service or affect the 200 already sent to Shopify
+- Do not throw — a failed CAPI call must not crash the service or affect the 200 already sent to Shopify
 
-**test_event_code behavior:** Include the field in the payload only when `clientConfig.testEventCode` is a non-empty string. In production this field must be absent entirely — not `null`, not `""`, fully absent.
+**test_event_code behavior:** Include the field only when `clientConfig.testEventCode` is a non-empty string. In production this field must be fully absent — not `null`, not `""`.
 
 ---
 
-### 6.5 `src/routes/webhook.js`
+### 7.5 `src/routes/webhook.js`
 
 **Purpose:** The single route handler. Orchestrates the full pipeline for an incoming Shopify order webhook.
 
@@ -220,8 +291,9 @@ For the POC, a single client's credentials live directly in `.env`. When scaling
 4. Respond 200 OK immediately
    ← Shopify considers the webhook delivered at this point
 5. Parse req.body (already parsed by Express, use as-is)
-6. Log: order received — slug, order ID, order total, currency, customer IP
-7. Call meta.sendPurchaseEvent(order, clientConfig) — do not await inline
+6. Determine customer type from order.customer.orders_count
+7. Log: order received — slug, order ID, order total, currency, customer IP, customer type
+8. Call meta.sendPurchaseEvent(order, clientConfig) — do not await inline
    → Wrap in async IIFE, catch and log any unexpected errors
 ```
 
@@ -237,19 +309,21 @@ For the POC, a single client's credentials live directly in `.env`. When scaling
   "orderTotal": "89.99",
   "currency": "EUR",
   "customerIp": "82.45.12.200",
-  "userAgent": "Mozilla/5.0 ...",
+  "customerType": "new",
   "eventId": "shopify_12345678",
   "metaStatus": "ok",
-  "metaEventsReceived": 1,
+  "metaEventsReceived": 2,
   "time": "2026-04-28T14:32:00.000Z"
 }
 ```
 
-**What never appears in logs:** Email, phone, name, address, or any raw PII. Only order ID, total, currency, IP, and Meta response metadata.
+Note `metaEventsReceived: 2` — Meta confirms receipt of both events in the same response.
+
+**What never appears in logs:** Email, phone, name, address, or any raw PII. Only order ID, total, currency, IP, customer type, and Meta response metadata.
 
 ---
 
-### 6.6 `config/clients.js`
+### 7.6 `config/clients.js`
 
 **Purpose:** Single source of truth for client credentials. Reads from environment variables and exports a lookup function.
 
@@ -275,7 +349,7 @@ No dynamic loading, no file watching, no database. When a new client is added, t
 
 ---
 
-### 6.7 `src/index.js`
+### 7.7 `src/index.js`
 
 **Purpose:** Application entry point. Wires everything together and starts the server.
 
@@ -290,7 +364,7 @@ No dynamic loading, no file watching, no database. When a new client is added, t
 
 ---
 
-## 7. Shopify Webhook Setup
+## 8. Shopify Webhook Setup
 
 Do this after the service is deployed and reachable over HTTPS.
 
@@ -299,35 +373,35 @@ Do this after the service is deployed and reachable over HTTPS.
 3. Click **Create webhook**
 4. **Event:** `Order payment` — fires only when payment is confirmed. Do not use `orders/created` which fires for unpaid orders too
 5. **Format:** `JSON`
-6. **URL:** `https://capi.your-domain.com/webhooks/studio-hogo-client1/order-paid`
+6. **URL:** `https://capi.studio-hogo.com/webhooks/{client-slug}/order-paid`
 7. **Webhook API version:** Latest stable (e.g. `2024-04`)
 8. Click **Save**
 
 Shopify sends an automatic test ping on save. Expected responses:
 
-| Response | Meaning |
-|---|---|
-| `200` | Service running, slug found, all good |
-| `404` | Slug not found in `config/clients.js` |
-| `401` | Signing secret is wrong or not yet set |
-| Connection refused | Nginx not running or wrong port |
+| Response           | Meaning                                |
+| ------------------ | -------------------------------------- |
+| `200`              | Service running, slug found, all good  |
+| `404`              | Slug not found in `config/clients.js`  |
+| `401`              | Signing secret is wrong or not yet set |
+| Connection refused | Nginx not running or wrong port        |
 
 **Get the signing secret:**
-After saving, click **Show signing key** on the webhook entry. Copy the value into `.env` as `SHOPIFY_WEBHOOK_SECRET`. Restart the service. Send another test ping — should return `200`.
+After saving, click **Show signing key** on the webhook entry. Copy the value into `.env` as `SHOPIFY_WEBHOOK_SECRET`. Restart the service.
 
 ---
 
-## 8. Meta Setup
+## 9. Meta Setup
 
-### 8.1 Collect credentials
+### 9.1 Collect credentials
 
-| Item | Where | Goes into |
-|---|---|---|
-| Pixel ID | Events Manager → Data Sources → your pixel | `META_PIXEL_ID` in `.env` |
-| CAPI Access Token | Events Manager → Settings → Conversions API → Generate token | `META_CAPI_TOKEN` in `.env` |
-| Test Event Code | Events Manager → Test Events tab | `META_TEST_EVENT_CODE` in `.env` |
+| Item              | Where                                                        | Goes into                        |
+| ----------------- | ------------------------------------------------------------ | -------------------------------- |
+| Pixel ID          | Events Manager → Data Sources → your pixel                   | `META_PIXEL_ID` in `.env`        |
+| CAPI Access Token | Events Manager → Settings → Conversions API → Generate token | `META_CAPI_TOKEN` in `.env`      |
+| Test Event Code   | Events Manager → Test Events tab                             | `META_TEST_EVENT_CODE` in `.env` |
 
-### 8.2 Generate the CAPI Access Token
+### 9.2 Generate the CAPI Access Token
 
 1. Go to [business.facebook.com](https://business.facebook.com) → **Events Manager**
 2. Select the client's Pixel from the Data Sources list
@@ -337,7 +411,17 @@ After saving, click **Show signing key** on the webhook entry. Copy the value in
 
 > ⚠️ This token has write access to the client's pixel. It lives only in `.env` on your server — never in code, never in git.
 
-### 8.3 Verify the browser pixel is already active
+### 9.3 Setting up Custom Conversions for the new events
+
+After the first real orders come through, set up Custom Conversions in Meta so marketers can use `NewCustomerPurchase` and `ReturningCustomerPurchase` in their reporting:
+
+1. Events Manager → **Custom Conversions** → Create
+2. Set event to `NewCustomerPurchase` → name it "New Customer Purchase" → Save
+3. Repeat for `ReturningCustomerPurchase` → name it "Returning Customer Purchase"
+
+These custom conversions then become available as columns in Ads Manager reporting and as objectives for campaigns.
+
+### 9.4 Verify the browser pixel is already active
 
 Before CAPI is relevant, the browser pixel needs to be working:
 1. Install **Meta Pixel Helper** Chrome extension
@@ -347,9 +431,9 @@ Before CAPI is relevant, the browser pixel needs to be working:
 
 ---
 
-## 9. Browser Pixel Deduplication Update
+## 10. Browser Pixel Deduplication Update
 
-The browser pixel fires a `Purchase` event on the Thank You page. Your CAPI service sends the same event server-side. Without a shared identifier, Meta counts it twice.
+The browser pixel fires a `Purchase` event on the Thank You page. Your CAPI service sends the same `Purchase` event server-side. Without a shared identifier, Meta counts it twice.
 
 The fix is a one-line change in the Shopify theme's order status page — either in `order-status.liquid` or in the **Additional Scripts** field at Admin → Settings → Checkout → Order status page.
 
@@ -371,38 +455,39 @@ fbq('track', 'Purchase', {
 });
 ```
 
-The `{{ checkout.order_id }}` Liquid variable outputs the Shopify numeric order ID. Your CAPI service constructs `event_id` as `"shopify_" + order.id` — they match exactly. Meta sees the same `event_id` from both paths and counts one conversion.
+The `{{ checkout.order_id }}` Liquid variable outputs the Shopify numeric order ID. Your CAPI service constructs `event_id` as `"shopify_" + order.id` — they match exactly. Meta deduplicates and counts one `Purchase`.
 
-> This change must be coordinated with whoever manages the Shopify theme. Without it, every purchase will be counted twice in Meta reporting — worse than having no CAPI at all.
+The custom events (`NewCustomerPurchase` / `ReturningCustomerPurchase`) use a different `event_id` format (`shopify_custom_` + order.id) and are server-side only — no browser pixel equivalent, no deduplication needed.
+
+> This change must be coordinated with whoever manages the Shopify theme. Without it, every purchase will be counted twice in Meta reporting.
 
 ---
 
-## 10. Deployment
+## 11. Deployment
 
-### 10.1 Prerequisites
+### 11.1 Prerequisites
 
-- Your VPS is already running two Node.js services on ports 3001 and 3002
-- Nginx is installed and managing those services
-- PM2 is installed globally
-- Node.js 18+ is installed (required for native `fetch`)
+- VPS running with `hogo` user created and SSH access configured
+- Nginx installed
+- PM2 installed under `hogo` user
+- Node.js 18+ installed
+- `capi.studio-hogo.com` DNS A record pointing to `109.228.48.216`
 
-### 10.2 Server Setup (one time)
+### 11.2 Server Setup
 
 ```bash
-# Upload or clone the project
-cd /var/www   # or wherever your other services live
+ssh hogo@109.228.48.216
+cd /home/hogo
+
 git clone <repo> shopify-meta-capi
 cd shopify-meta-capi
 
-# Install dependencies
 npm install
-
-# Create .env from template and fill in all values
 cp .env.example .env
 nano .env
 ```
 
-### 10.3 PM2
+### 11.3 PM2
 
 ```js
 // ecosystem.config.js
@@ -422,23 +507,27 @@ module.exports = {
 
 ```bash
 pm2 start ecosystem.config.js --env production
-pm2 save   # persist across reboots
-pm2 logs shopify-meta-capi   # confirm startup logs look correct
+pm2 save
+pm2 logs shopify-meta-capi --lines 20
 ```
 
-### 10.4 Nginx
+Expected startup log:
+```json
+{"port":"3003","nodeEnv":"production","clients":["jylor"],"msg":"Server started"}
+```
 
-Add a new server block (or a location block on an existing domain). A dedicated subdomain is cleaner and gives you a professional URL to hand to clients:
+### 11.4 Nginx
+
+```bash
+sudo nano /etc/nginx/sites-available/shopify-capi
+```
+
+Paste (HTTP only — Certbot adds SSL automatically):
 
 ```nginx
-# /etc/nginx/sites-available/shopify-capi
-
 server {
-    listen 443 ssl;
-    server_name capi.your-domain.com;
-
-    ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+    listen 80;
+    server_name capi.studio-hogo.com;
 
     location /webhooks/ {
         proxy_pass           http://localhost:3003;
@@ -446,184 +535,127 @@ server {
         proxy_set_header     X-Real-IP $remote_addr;
         proxy_set_header     X-Forwarded-For $proxy_add_x_forwarded_for;
         client_max_body_size 2M;
-        proxy_buffering      off;   # Shopify needs a fast response, don't buffer
+        proxy_buffering      off;
     }
 
     location / {
-        return 404;   # This server does nothing except receive webhooks
+        return 404;
     }
 }
-
-server {
-    listen 80;
-    server_name capi.your-domain.com;
-    return 301 https://$host$request_uri;  # Shopify requires HTTPS
-}
 ```
 
 ```bash
-# Enable the config
-ln -s /etc/nginx/sites-available/shopify-capi /etc/nginx/sites-enabled/
-
-# Issue SSL cert if subdomain is new
-certbot --nginx -d capi.your-domain.com
-
-# Test and reload
-nginx -t && systemctl reload nginx
+sudo ln -s /etc/nginx/sites-available/shopify-capi /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot --nginx -d capi.studio-hogo.com
 ```
 
-### 10.5 Smoke Test
+### 11.5 Smoke Tests
 
 ```bash
-# Should return 404 (slug not found) — not a network error
-curl -I https://capi.your-domain.com/webhooks/unknown-slug/order-paid
+# 404 — unknown slug
+curl -I https://capi.studio-hogo.com/webhooks/unknown-slug/order-paid
 
-# Should return 401 (slug found, no HMAC header)
-curl -X POST https://capi.your-domain.com/webhooks/studio-hogo-client1/order-paid \
+# 401 — slug found, no signature
+curl -X POST https://capi.studio-hogo.com/webhooks/jylor/order-paid \
   -H "Content-Type: application/json" \
   -d '{"test": true}'
 ```
 
-If both behave as expected, the service is live and correctly routing.
-
 ---
 
-## 11. Testing
+## 12. Testing
 
-### 11.1 Full End-to-End Test
+### 12.1 What to verify in Meta Test Events
 
-1. Set `META_TEST_EVENT_CODE` in `.env` to the value from Meta Events Manager → Test Events tab
-2. Restart the service: `pm2 restart shopify-meta-capi`
-3. Enable **Bogus Gateway** in Shopify Admin → Settings → Payments
-4. Place a test order using card number `1` (payment success)
-5. Watch logs in real time: `pm2 logs shopify-meta-capi`
-6. Confirm the log shows: signature verified → CAPI call sent → Meta responded ok
-7. Open Meta Events Manager → **Test Events** tab
-8. The `Purchase` event should appear within a few seconds
+With `META_TEST_EVENT_CODE` set, place a test order. In Meta Events Manager → Test Events tab, you should see **two events** appear for the same order:
 
-**What to verify in Meta Test Events:**
+| Event                                                | event_id format           | Expected                                                |
+| ---------------------------------------------------- | ------------------------- | ------------------------------------------------------- |
+| `Purchase`                                           | `shopify_12345678`        | value, currency, hashed user_data, new_customer boolean |
+| `NewCustomerPurchase` or `ReturningCustomerPurchase` | `shopify_custom_12345678` | value, currency, hashed user_data                       |
 
-| Field | Expected value |
-|---|---|
-| Event name | `Purchase` |
-| Value | Order total matching Shopify |
-| Currency | Correct currency code |
-| `event_id` | `shopify_` + the Shopify order ID |
-| `user_data.em` | Present, long hex string (hashed email) |
-| `client_ip_address` | Present, matches customer IP |
+### 12.2 What to verify in logs
 
-### 11.2 Signature Verification Test
-
-```bash
-# Test with a tampered body — should return 401
-curl -X POST https://capi.your-domain.com/webhooks/studio-hogo-client1/order-paid \
-  -H "Content-Type: application/json" \
-  -H "X-Shopify-Hmac-SHA256: invalidsignature==" \
-  -d '{"id": 99999, "total_price": "999.00"}'
+```json
+{"msg":"Order received", "client":"jylor", "orderId":"...", "customerType":"new", ...}
+{"msg":"Meta CAPI call succeeded", "metaEventsReceived": 2, ...}
 ```
 
-If you get `401`, signature rejection is working. If you get `200`, the raw body middleware or the verification logic has a bug.
+`metaEventsReceived: 2` confirms Meta received both events in the same call.
 
-### 11.3 Deduplication Test
+### 12.3 Deduplication check
 
-After the first real test order, check Meta Events Manager → Overview. The same order should show as **1** Purchase event, not 2. If it shows 2, the browser pixel `eventID` was not added (Section 9) or the `event_id` format doesn't match between pixel and CAPI.
+After adding the `eventID` to the browser pixel, place a test order and confirm Meta Test Events shows:
+- `Purchase` → **1 event** (not 2 — deduplicated with browser pixel)
+- `NewCustomerPurchase` or `ReturningCustomerPurchase` → **1 event** (server-side only, no dedup needed)
 
-### 11.4 Go Live
+### 12.4 Go live
 
-1. Set `META_TEST_EVENT_CODE=` (empty) in `.env`
-2. `pm2 restart shopify-meta-capi`
-3. Disable Bogus Gateway in Shopify Admin
-4. Monitor for 24–48 hours: `pm2 logs shopify-meta-capi`
-5. After 48 hours, compare Shopify order count to Meta Events Manager CAPI Purchase count — they should be within 5%
+```bash
+nano .env
+# META_TEST_EVENT_CODE=   ← empty
+
+pm2 restart shopify-meta-capi
+```
+
+Monitor for 48 hours. After 48 hours compare Shopify order count to Meta CAPI `Purchase` event count — should be within 5%.
 
 ---
 
-## 12. Scaling to Additional Clients
+## 13. Scaling to Additional Clients
 
-The POC is built so that adding a second or third client requires no code changes and no redeployment of the service — only config and a restart.
-
-### What changes per new client
-
-**1. Add their credentials to `.env`:**
+**1. Add credentials to `.env`:**
 
 ```bash
-# --- Client: client-two ---
 CLIENT_TWO_SLUG=client-two
 CLIENT_TWO_SHOPIFY_SECRET=...
 CLIENT_TWO_META_PIXEL_ID=...
 CLIENT_TWO_META_CAPI_TOKEN=...
 CLIENT_TWO_TEST_EVENT_CODE=
-CLIENT_TWO_STORE_URL=https://client-two.myshopify.com
+CLIENT_TWO_STORE_URL=https://client-two.com
 ```
 
-**2. Extend `config/clients.js`:**
+**2. Extend `config/clients.js`** with a new entry block.
 
-```js
-const clients = {
-  [process.env.CLIENT_SLUG]: {
-    shopifySecret: process.env.SHOPIFY_WEBHOOK_SECRET,
-    metaPixelId:   process.env.META_PIXEL_ID,
-    metaCapiToken: process.env.META_CAPI_TOKEN,
-    testEventCode: process.env.META_TEST_EVENT_CODE || '',
-    storeUrl:      process.env.STORE_URL,
-  },
-  [process.env.CLIENT_TWO_SLUG]: {
-    shopifySecret: process.env.CLIENT_TWO_SHOPIFY_SECRET,
-    metaPixelId:   process.env.CLIENT_TWO_META_PIXEL_ID,
-    metaCapiToken: process.env.CLIENT_TWO_META_CAPI_TOKEN,
-    testEventCode: process.env.CLIENT_TWO_TEST_EVENT_CODE || '',
-    storeUrl:      process.env.CLIENT_TWO_STORE_URL,
-  }
-}
+**3. Restart:** `pm2 restart shopify-meta-capi`
+
+**4. Create Shopify webhook** pointing to:
+```
+https://capi.studio-hogo.com/webhooks/client-two/order-paid
 ```
 
-**3. Restart the service:**
-```bash
-pm2 restart shopify-meta-capi
-```
+**5. Copy signing secret into `.env`, restart, run test flow.**
 
-**4. Create the Shopify webhook for client two** pointing to their slug URL:
-```
-https://capi.your-domain.com/webhooks/client-two/order-paid
-```
+The dual event logic (`Purchase` + customer type custom event) applies automatically to all clients — no per-client configuration needed.
 
-**5. Copy their signing secret into `.env`, restart again**
+### Natural limit of this approach
 
-**6. Run the same end-to-end test from Section 11 for this client**
-
-### Isolation guarantee
-
-Because `getClient(slug)` looks up credentials by the URL slug, client A's webhook hitting `/webhooks/client-one/order-paid` will always load client one's Shopify secret for verification and client one's Pixel ID and CAPI token for the Meta call. There is no way for a request to accidentally use another client's credentials as long as the slug-to-config mapping is correct.
-
-### The natural limit of this approach
-
-This flat `.env` + `clients.js` pattern works cleanly up to roughly 5–6 clients. Beyond that, the env file becomes unwieldy and a database-backed config becomes the right move. That is precisely the transition point where the POC becomes an MVP and the full NestJS + Prisma + PostgreSQL architecture (with a management dashboard) takes over.
+The flat `.env` + `clients.js` pattern works cleanly up to ~5–6 clients. Beyond that, credentials move into a database. That is the transition point where this POC becomes an MVP with the full NestJS + Prisma + PostgreSQL architecture.
 
 ---
 
-## 13. Known Limitations of This POC
+## 14. Known Limitations of This POC
 
-These are deliberate omissions, not oversights. Each one is the right decision for a POC and the wrong decision for a production product.
-
-| Limitation | Impact | Resolution in full product |
-|---|---|---|
-| No database | Customer data is not retained — orders are processed and discarded | PostgreSQL + Prisma in the full product |
-| No dashboard | Adding clients requires SSH access | NestJS admin dashboard |
-| Flat config | Does not scale beyond ~5 clients | Client table in the database |
-| Meta only | TikTok and Snapchat CAPI not supported | Per-platform service modules |
-| No retry logic | If the Meta CAPI call fails, the event is lost | Job queue (BullMQ) with retry in the full product |
-| No attribution tracking | Referring site, UTM params, new vs returning not stored | Captured and stored in the customer/order DB tables |
-| Single platform routing | One webhook, one destination per client | Multi-platform fan-out in the full product |
+| Limitation              | Impact                                | Resolution in full product     |
+| ----------------------- | ------------------------------------- | ------------------------------ |
+| No database             | Customer data not retained            | PostgreSQL + Prisma            |
+| No dashboard            | Adding clients requires SSH           | NestJS admin dashboard         |
+| Flat config             | Doesn't scale beyond ~5 clients       | Client table in DB             |
+| Meta only               | No TikTok or Snapchat CAPI            | Per-platform service modules   |
+| No retry logic          | Failed CAPI call = lost event         | BullMQ job queue with retry    |
+| No attribution tracking | UTM params, referring site not stored | Captured in DB in full product |
+| Single platform routing | One webhook, one destination          | Multi-platform fan-out         |
 
 ---
 
-## 14. Out of Scope for This POC
+## 15. Out of Scope for This POC
 
 - Customer data storage of any kind
 - TikTok Conversions API
 - Snapchat Conversions API
 - Attribution and UTM tracking
-- New vs returning customer detection
 - Admin dashboard or any UI
 - Retry logic for failed CAPI calls
 - Multi-platform event fan-out
