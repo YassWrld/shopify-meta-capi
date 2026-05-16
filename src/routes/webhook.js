@@ -39,12 +39,13 @@ router.post('/:clientSlug/order-paid', (req, res) => {
   })
 
   logger.info({
-    orderTotal:   order.total_price,
-    currency:     order.currency,
-    customerIp:   order.browser_ip,
-    userAgent:    order.client_details?.user_agent,
+    orderTotal:    order.total_price,
+    currency:      order.currency,
+    customerIp:    order.browser_ip,
+    userAgent:     order.client_details?.user_agent,
     eventId,
     customerType,
+    ordersCount:   order.customer?.orders_count,
   }, 'Order received')
 
   ;(async () => {
