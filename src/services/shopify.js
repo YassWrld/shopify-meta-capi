@@ -54,7 +54,9 @@ async function getCustomerOrdersCount(email, clientConfig) {
       return 'new'
     }
 
-    return numberOfOrders > 1 ? 'returning' : 'new'
+    const customerType = numberOfOrders > 1 ? 'returning' : 'new'
+    console.log(`[shopify:${slug}] numberOfOrders=${numberOfOrders} customerType=${customerType}`)
+    return customerType
   } catch (err) {
     console.error(`[shopify:${slug}] getCustomerOrdersCount failed:`, err)
     return 'new'
