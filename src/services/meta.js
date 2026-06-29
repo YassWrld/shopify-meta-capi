@@ -1,14 +1,14 @@
 const { hashEmail, hashPhone, hashName, hashCity, hashZip, hashCountry, hashState } = require('./hash')
 
-async function sendPurchaseEvent(order, clientConfig, logger) {
+async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
   const billing = order.billing_address || {}
   const orderId = order.admin_graphql_api_id
     ? order.admin_graphql_api_id.split('/').pop()
     : String(order.id)
 
-  const ordersCount = order.customer?.orders_count
-  const isNewCustomer = !ordersCount || ordersCount <= 1
-  const customEventName = isNewCustomer ? 'NewCustomerPurchase' : 'ReturningCustomerPurchase'
+  const customEventName = customerType === 'returning'
+    ? 'ReturningCustomerPurchase'
+    : 'NewCustomerPurchase'
 
   const userData = {
     em:                hashEmail(order.email || order.contact_email),
@@ -43,7 +43,7 @@ async function sendPurchaseEvent(order, clientConfig, logger) {
     user_data:        userData,
     custom_data: {
       ...customData,
-      new_customer: isNewCustomer,
+      new_vs_returning: customerType,
     },
   }
 

@@ -1,6 +1,6 @@
 const express = require('express')
 const { getClient } = require('../../config/clients')
-const { verifyWebhookSignature } = require('../services/shopify')
+const { verifyWebhookSignature, getCustomerOrdersCount } = require('../services/shopify')
 const { sendPurchaseEvent } = require('../services/meta')
 
 const router = express.Router()
@@ -30,27 +30,25 @@ router.post('/:clientSlug/order-paid', (req, res) => {
     : String(order.id)
   const eventId = 'shopify_' + orderId
 
-  const ordersCount = order.customer?.orders_count
-  const customerType = ordersCount > 1 ? 'returning' : 'new'
-
   const logger = req.log.child({
     client: clientSlug,
     orderId,
   })
 
-  logger.info({
-    orderTotal:    order.total_price,
-    currency:      order.currency,
-    customerIp:    order.browser_ip,
-    userAgent:     order.client_details?.user_agent,
-    eventId,
-    customerType,
-    ordersCount:   order.customer?.orders_count,
-  }, 'Order received')
-
   ;(async () => {
     try {
-      await sendPurchaseEvent(order, clientConfig, logger)
+      const customerType = await getCustomerOrdersCount(order.email, clientConfig)
+
+      logger.info({
+        orderTotal:    order.total_price,
+        currency:      order.currency,
+        customerIp:    order.browser_ip,
+        userAgent:     order.client_details?.user_agent,
+        eventId,
+        customerType,
+      }, 'Order received')
+
+      await sendPurchaseEvent(order, clientConfig, customerType, logger)
     } catch (err) {
       logger.error({ err }, 'Unexpected error in Meta CAPI call')
     }

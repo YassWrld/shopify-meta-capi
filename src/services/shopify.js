@@ -18,4 +18,47 @@ function verifyWebhookSignature(rawBody, hmacHeader, secret) {
   }
 }
 
-module.exports = { verifyWebhookSignature }
+async function getCustomerOrdersCount(email, clientConfig) {
+  const slug = clientConfig?.shopifyStoreDomain || 'unknown'
+  try {
+    if (!email) {
+      console.error(`[shopify:${slug}] getCustomerOrdersCount: missing email, defaulting to "new"`)
+      return 'new'
+    }
+
+    const url = `https://${clientConfig.shopifyStoreDomain}/admin/api/2026-04/graphql.json`
+
+    const body = {
+      query: 'query($q:String!){ customers(first:1, query:$q){ edges{ node{ id numberOfOrders } } } }',
+      variables: { q: `email:"${email}"` },
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': clientConfig.shopifyAdminToken,
+      },
+      body: JSON.stringify(body),
+    })
+
+    const json = await response.json()
+
+    const edges = json?.data?.customers?.edges
+    if (!Array.isArray(edges) || edges.length === 0) {
+      return 'new'
+    }
+
+    const numberOfOrders = Number(edges[0]?.node?.numberOfOrders)
+    if (!Number.isFinite(numberOfOrders)) {
+      return 'new'
+    }
+
+    return numberOfOrders > 1 ? 'returning' : 'new'
+  } catch (err) {
+    console.error(`[shopify:${slug}] getCustomerOrdersCount failed:`, err)
+    return 'new'
+  }
+}
+
+module.exports = { verifyWebhookSignature, getCustomerOrdersCount }
