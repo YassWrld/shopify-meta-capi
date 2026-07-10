@@ -46,6 +46,10 @@ router.post('/:clientSlug/order-paid', (req, res) => {
         userAgent:     order.client_details?.user_agent,
         eventId,
         customerType,
+        isTest:        order.test,
+        orderName:     order.name,
+        sourceName:    order.source_name,
+        hasEmail:      Boolean(order.email || order.contact_email),
       }, 'Order received')
 
       await sendPurchaseEvent(order, clientConfig, customerType, logger)

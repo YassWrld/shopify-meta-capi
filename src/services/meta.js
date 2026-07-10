@@ -74,11 +74,17 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
   const responseBody = await response.json()
 
   if (!response.ok) {
+    const err = responseBody?.error || {}
     logger.error({
       metaStatus:       'error',
       metaHttpStatus:   response.status,
-      metaErrorMessage: responseBody?.error?.message,
-      metaErrorCode:    responseBody?.error?.code,
+      metaErrorMessage: err.message,
+      metaErrorCode:    err.code,
+      metaErrorSubcode: err.error_subcode,
+      metaErrorType:    err.type,
+      metaErrorUserTitle: err.error_user_title,
+      metaErrorUserMsg:   err.error_user_msg,
+      metaFbtraceId:    err.fbtrace_id,
     }, 'Meta CAPI call failed')
     return
   }
