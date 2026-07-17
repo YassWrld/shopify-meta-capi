@@ -17,6 +17,15 @@ const clients = {
     shopifyAdminToken:  process.env.CLIENT_TWO_SHOPIFY_ADMIN_TOKEN,
     shopifyStoreDomain: process.env.CLIENT_TWO_SHOPIFY_STORE_DOMAIN,
   },
+  [process.env.CLIENT_THREE_SLUG]: {
+    shopifySecret:      process.env.CLIENT_THREE_SHOPIFY_WEBHOOK_SECRET,
+    metaPixelId:        process.env.CLIENT_THREE_META_PIXEL_ID,
+    metaCapiToken:      process.env.CLIENT_THREE_META_CAPI_TOKEN,
+    testEventCode:      process.env.CLIENT_THREE_META_TEST_EVENT_CODE || '',
+    storeUrl:           process.env.CLIENT_THREE_STORE_URL,
+    shopifyAdminToken:  process.env.CLIENT_THREE_SHOPIFY_ADMIN_TOKEN,
+    shopifyStoreDomain: process.env.CLIENT_THREE_SHOPIFY_STORE_DOMAIN,
+  },
 }
 
 module.exports = {
