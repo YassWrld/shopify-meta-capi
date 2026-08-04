@@ -63,7 +63,7 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
     payload.test_event_code = clientConfig.testEventCode
   }
 
-  const url = `https://graph.facebook.com/v19.0/${clientConfig.metaPixelId}/events?access_token=${clientConfig.metaCapiToken}`
+  const url = `https://graph.facebook.com/v21.0/${clientConfig.metaPixelId}/events?access_token=${clientConfig.metaCapiToken}`
 
   const response = await fetch(url, {
     method: 'POST',

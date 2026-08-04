@@ -19,6 +19,10 @@ function verifyWebhookSignature(rawBody, hmacHeader, secret) {
 }
 
 const LOOKUP_TIMEOUT_MS = 3000
+const LOOKUP_MAX_RETRIES = 2      // extra attempts when Shopify throttles the lookup
+const LOOKUP_RETRY_BASE_MS = 500  // exponential backoff base between retries
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function getCustomerOrdersCount(email, clientConfig) {
   const slug = clientConfig?.shopifyStoreDomain || 'unknown'
@@ -31,29 +35,45 @@ async function getCustomerOrdersCount(email, clientConfig) {
     const url = `https://${clientConfig.shopifyStoreDomain}/admin/api/2026-04/graphql.json`
 
     const body = {
-      query: 'query($q:String!){ customers(first:1, query:$q){ edges{ node{ id numberOfOrders } } } }',
+      query: 'query($q:String!){ customers(first:10, query:$q){ edges{ node{ id numberOfOrders } } } }',
       variables: { q: `email:"${email}"` },
     }
 
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS)
-
     let response
-    try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': clientConfig.shopifyAdminToken,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      })
-    } finally {
-      clearTimeout(timeout)
-    }
+    let json
+    for (let attempt = 0; ; attempt++) {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS)
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Access-Token': clientConfig.shopifyAdminToken,
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        })
+      } finally {
+        clearTimeout(timeout)
+      }
 
-    const json = await response.json()
+      json = await response.json()
+
+      // Retry only on throttling (HTTP 429 or a THROTTLED GraphQL error), with
+      // exponential backoff, so rate-limiting doesn't masquerade as a new customer.
+      const throttled =
+        response.status === 429 ||
+        (Array.isArray(json?.errors) && json.errors.some((e) => e?.extensions?.code === 'THROTTLED'))
+
+      if (throttled && attempt < LOOKUP_MAX_RETRIES) {
+        const backoff = LOOKUP_RETRY_BASE_MS * Math.pow(2, attempt)
+        console.error(`[shopify:${slug}] getCustomerOrdersCount throttled, retrying in ${backoff}ms (attempt ${attempt + 1}/${LOOKUP_MAX_RETRIES})`)
+        await sleep(backoff)
+        continue
+      }
+      break
+    }
 
     // Failure: HTTP error from Shopify. Not a real "new" customer — the lookup failed.
     if (!response.ok) {
@@ -82,16 +102,28 @@ async function getCustomerOrdersCount(email, clientConfig) {
       return 'new'
     }
 
-    const numberOfOrders = Number(edges[0]?.node?.numberOfOrders)
+    // Sum orders across ALL customer records for this email. Guest checkouts can
+    // create multiple records for the same person (each with numberOfOrders=1),
+    // so reading a single record would under-count and misread a returning buyer
+    // as new. Summing stays correct in the normal case too (one record → its count).
+    let totalOrders = 0
+    let sawValidCount = false
+    for (const edge of edges) {
+      const n = Number(edge?.node?.numberOfOrders)
+      if (Number.isFinite(n)) {
+        totalOrders += n
+        sawValidCount = true
+      }
+    }
 
-    // Failure: found a customer but the count wasn't a number. Lookup unreliable.
-    if (!Number.isFinite(numberOfOrders)) {
+    // Failure: found records but none had a numeric count. Lookup unreliable.
+    if (!sawValidCount) {
       console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: numberOfOrders not numeric, defaulting to "new"`)
       return 'new'
     }
 
-    const customerType = numberOfOrders > 1 ? 'returning' : 'new'
-    console.log(`[shopify:${slug}] numberOfOrders=${numberOfOrders} customerType=${customerType}`)
+    const customerType = totalOrders > 1 ? 'returning' : 'new'
+    console.log(`[shopify:${slug}] records=${edges.length} totalOrders=${totalOrders} customerType=${customerType}`)
     return customerType
   } catch (err) {
     if (err.name === 'AbortError') {
