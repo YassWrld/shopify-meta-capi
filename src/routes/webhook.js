@@ -37,7 +37,7 @@ router.post('/:clientSlug/order-paid', (req, res) => {
 
   ;(async () => {
     try {
-      const customerType = await getCustomerOrdersCount(order.email, clientConfig)
+      const customerType = await getCustomerOrdersCount(order.email || order.contact_email, clientConfig)
 
       logger.info({
         orderTotal:    order.total_price,
