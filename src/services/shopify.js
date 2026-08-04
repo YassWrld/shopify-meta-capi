@@ -18,6 +18,8 @@ function verifyWebhookSignature(rawBody, hmacHeader, secret) {
   }
 }
 
+const LOOKUP_TIMEOUT_MS = 3000
+
 async function getCustomerOrdersCount(email, clientConfig) {
   const slug = clientConfig?.shopifyStoreDomain || 'unknown'
   try {
@@ -33,14 +35,23 @@ async function getCustomerOrdersCount(email, clientConfig) {
       variables: { q: `email:"${email}"` },
     }
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': clientConfig.shopifyAdminToken,
-      },
-      body: JSON.stringify(body),
-    })
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), LOOKUP_TIMEOUT_MS)
+
+    let response
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': clientConfig.shopifyAdminToken,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+    } finally {
+      clearTimeout(timeout)
+    }
 
     const json = await response.json()
 
@@ -58,7 +69,11 @@ async function getCustomerOrdersCount(email, clientConfig) {
     console.log(`[shopify:${slug}] numberOfOrders=${numberOfOrders} customerType=${customerType}`)
     return customerType
   } catch (err) {
-    console.error(`[shopify:${slug}] getCustomerOrdersCount failed:`, err)
+    if (err.name === 'AbortError') {
+      console.error(`[shopify:${slug}] getCustomerOrdersCount timed out after ${LOOKUP_TIMEOUT_MS}ms, defaulting to "new"`)
+    } else {
+      console.error(`[shopify:${slug}] getCustomerOrdersCount failed:`, err)
+    }
     return 'new'
   }
 }
