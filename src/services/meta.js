@@ -76,15 +76,19 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
   if (!response.ok) {
     const err = responseBody?.error || {}
     logger.error({
-      metaStatus:       'error',
-      metaHttpStatus:   response.status,
-      metaErrorMessage: err.message,
-      metaErrorCode:    err.code,
-      metaErrorSubcode: err.error_subcode,
-      metaErrorType:    err.type,
+      metaStatus:         'error',
+      metaHttpStatus:     response.status,
+      events:             ['Purchase', customEventName],
+      customerType,
+      value:              customData.value,
+      currency:           order.currency,
+      metaErrorMessage:   err.message,
+      metaErrorCode:      err.code,
+      metaErrorSubcode:   err.error_subcode,
+      metaErrorType:      err.type,
       metaErrorUserTitle: err.error_user_title,
       metaErrorUserMsg:   err.error_user_msg,
-      metaFbtraceId:    err.fbtrace_id,
+      metaFbtraceId:      err.fbtrace_id,
     }, 'Meta CAPI call failed')
     return
   }
@@ -92,6 +96,10 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
   logger.info({
     metaStatus:         'ok',
     metaEventsReceived: responseBody.events_received,
+    events:             ['Purchase', customEventName],
+    customerType,
+    value:              customData.value,
+    currency:           order.currency,
   }, 'Meta CAPI call succeeded')
 }
 

@@ -37,24 +37,23 @@ router.post('/:clientSlug/order-paid', (req, res) => {
 
   ;(async () => {
     try {
-      const customerType = await getCustomerOrdersCount(order.email || order.contact_email, clientConfig)
-
       logger.info({
-        orderTotal:    order.total_price,
-        currency:      order.currency,
-        customerIp:    order.browser_ip,
-        userAgent:     order.client_details?.user_agent,
+        orderTotal: order.total_price,
+        currency:   order.currency,
+        customerIp: order.browser_ip,
+        userAgent:  order.client_details?.user_agent,
         eventId,
-        customerType,
-        isTest:        order.test,
-        orderName:     order.name,
-        sourceName:    order.source_name,
-        hasEmail:      Boolean(order.email || order.contact_email),
+        isTest:     order.test,
+        orderName:  order.name,
+        sourceName: order.source_name,
+        hasEmail:   Boolean(order.email || order.contact_email),
       }, 'Order received')
+
+      const customerType = await getCustomerOrdersCount(order.email || order.contact_email, clientConfig, logger)
 
       await sendPurchaseEvent(order, clientConfig, customerType, logger)
     } catch (err) {
-      logger.error({ err }, 'Unexpected error in Meta CAPI call')
+      logger.error({ err }, 'Unexpected error processing order')
     }
   })()
 })

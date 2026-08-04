@@ -5,7 +5,14 @@ const pino = require('pino')
 const { clients, getClient } = require('../config/clients')
 const webhookRouter = require('./routes/webhook')
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  // Readable structured output: level as a label ("info"), ISO timestamps.
+  formatters: {
+    level: (label) => ({ level: label }),
+  },
+  timestamp: pino.stdTimeFunctions.isoTime,
+})
 
 const REQUIRED_FIELDS = ['shopifySecret', 'metaPixelId', 'metaCapiToken', 'storeUrl']
 

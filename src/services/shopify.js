@@ -24,11 +24,20 @@ const LOOKUP_RETRY_BASE_MS = 500  // exponential backoff base between retries
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-async function getCustomerOrdersCount(email, clientConfig) {
-  const slug = clientConfig?.shopifyStoreDomain || 'unknown'
+// Fallback so the function still logs sensibly when called outside the request
+// pipeline (e.g. standalone diagnostic scripts) without a Pino logger.
+const consoleFallbackLogger = {
+  info:  (obj, msg) => console.log(msg, JSON.stringify(obj)),
+  warn:  (obj, msg) => console.warn(msg, JSON.stringify(obj)),
+  error: (obj, msg) => console.error(msg, JSON.stringify(obj)),
+}
+
+async function getCustomerOrdersCount(email, clientConfig, logger) {
+  const log = logger || consoleFallbackLogger
+  const store = clientConfig?.shopifyStoreDomain || 'unknown'
   try {
     if (!email) {
-      console.error(`[shopify:${slug}] getCustomerOrdersCount: missing email, defaulting to "new"`)
+      log.warn({ store, reason: 'missing_email', customerType: 'new' }, 'Customer classified "new" — no email to look up')
       return 'new'
     }
 
@@ -67,9 +76,9 @@ async function getCustomerOrdersCount(email, clientConfig) {
         (Array.isArray(json?.errors) && json.errors.some((e) => e?.extensions?.code === 'THROTTLED'))
 
       if (throttled && attempt < LOOKUP_MAX_RETRIES) {
-        const backoff = LOOKUP_RETRY_BASE_MS * Math.pow(2, attempt)
-        console.error(`[shopify:${slug}] getCustomerOrdersCount throttled, retrying in ${backoff}ms (attempt ${attempt + 1}/${LOOKUP_MAX_RETRIES})`)
-        await sleep(backoff)
+        const backoffMs = LOOKUP_RETRY_BASE_MS * Math.pow(2, attempt)
+        log.warn({ store, attempt: attempt + 1, maxRetries: LOOKUP_MAX_RETRIES, backoffMs }, 'Shopify customer lookup throttled — retrying')
+        await sleep(backoffMs)
         continue
       }
       break
@@ -77,14 +86,14 @@ async function getCustomerOrdersCount(email, clientConfig) {
 
     // Failure: HTTP error from Shopify. Not a real "new" customer — the lookup failed.
     if (!response.ok) {
-      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: HTTP ${response.status}, defaulting to "new"`)
+      log.warn({ store, reason: 'http_error', httpStatus: response.status, customerType: 'new' }, 'Customer lookup failed — defaulting to "new"')
       return 'new'
     }
 
     // Failure: GraphQL-level errors (e.g. throttling, bad query). Lookup failed.
     if (json?.errors) {
       const throttled = json.errors.some((e) => e?.extensions?.code === 'THROTTLED')
-      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: GraphQL error${throttled ? ' (THROTTLED)' : ''}, defaulting to "new": ${JSON.stringify(json.errors)}`)
+      log.warn({ store, reason: throttled ? 'throttled' : 'graphql_error', errors: json.errors, customerType: 'new' }, 'Customer lookup failed — defaulting to "new"')
       return 'new'
     }
 
@@ -92,13 +101,13 @@ async function getCustomerOrdersCount(email, clientConfig) {
 
     // Failure: response shape wasn't what we expected. Lookup failed.
     if (!Array.isArray(edges)) {
-      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: malformed response, defaulting to "new"`)
+      log.warn({ store, reason: 'malformed_response', customerType: 'new' }, 'Customer lookup failed — defaulting to "new"')
       return 'new'
     }
 
     // Genuine: no customer matched this email → a true new customer.
     if (edges.length === 0) {
-      console.log(`[shopify:${slug}] customer not found → "new"`)
+      log.info({ store, reason: 'not_found', records: 0, customerType: 'new' }, 'Customer classified')
       return 'new'
     }
 
@@ -118,18 +127,18 @@ async function getCustomerOrdersCount(email, clientConfig) {
 
     // Failure: found records but none had a numeric count. Lookup unreliable.
     if (!sawValidCount) {
-      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: numberOfOrders not numeric, defaulting to "new"`)
+      log.warn({ store, reason: 'non_numeric_count', records: edges.length, customerType: 'new' }, 'Customer lookup failed — defaulting to "new"')
       return 'new'
     }
 
     const customerType = totalOrders > 1 ? 'returning' : 'new'
-    console.log(`[shopify:${slug}] records=${edges.length} totalOrders=${totalOrders} customerType=${customerType}`)
+    log.info({ store, reason: 'ok', records: edges.length, totalOrders, customerType }, 'Customer classified')
     return customerType
   } catch (err) {
     if (err.name === 'AbortError') {
-      console.error(`[shopify:${slug}] getCustomerOrdersCount timed out after ${LOOKUP_TIMEOUT_MS}ms, defaulting to "new"`)
+      log.warn({ store, reason: 'timeout', timeoutMs: LOOKUP_TIMEOUT_MS, customerType: 'new' }, 'Customer lookup timed out — defaulting to "new"')
     } else {
-      console.error(`[shopify:${slug}] getCustomerOrdersCount failed:`, err)
+      log.error({ store, reason: 'error', err: err.message, customerType: 'new' }, 'Customer lookup failed — defaulting to "new"')
     }
     return 'new'
   }
