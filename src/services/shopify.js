@@ -55,13 +55,38 @@ async function getCustomerOrdersCount(email, clientConfig) {
 
     const json = await response.json()
 
+    // Failure: HTTP error from Shopify. Not a real "new" customer — the lookup failed.
+    if (!response.ok) {
+      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: HTTP ${response.status}, defaulting to "new"`)
+      return 'new'
+    }
+
+    // Failure: GraphQL-level errors (e.g. throttling, bad query). Lookup failed.
+    if (json?.errors) {
+      const throttled = json.errors.some((e) => e?.extensions?.code === 'THROTTLED')
+      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: GraphQL error${throttled ? ' (THROTTLED)' : ''}, defaulting to "new": ${JSON.stringify(json.errors)}`)
+      return 'new'
+    }
+
     const edges = json?.data?.customers?.edges
-    if (!Array.isArray(edges) || edges.length === 0) {
+
+    // Failure: response shape wasn't what we expected. Lookup failed.
+    if (!Array.isArray(edges)) {
+      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: malformed response, defaulting to "new"`)
+      return 'new'
+    }
+
+    // Genuine: no customer matched this email → a true new customer.
+    if (edges.length === 0) {
+      console.log(`[shopify:${slug}] customer not found → "new"`)
       return 'new'
     }
 
     const numberOfOrders = Number(edges[0]?.node?.numberOfOrders)
+
+    // Failure: found a customer but the count wasn't a number. Lookup unreliable.
     if (!Number.isFinite(numberOfOrders)) {
+      console.error(`[shopify:${slug}] getCustomerOrdersCount lookup failed: numberOfOrders not numeric, defaulting to "new"`)
       return 'new'
     }
 
