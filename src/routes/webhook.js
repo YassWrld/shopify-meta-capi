@@ -49,7 +49,13 @@ router.post('/:clientSlug/order-paid', (req, res) => {
         hasEmail:   Boolean(order.email || order.contact_email),
       }, 'Order received')
 
-      const customerType = await getCustomerOrdersCount(order.email || order.contact_email, clientConfig, logger)
+      // Only classify (and hit the Shopify Admin API) if a customer-type event
+      // is actually enabled for this client. Otherwise it's wasted work.
+      const events = clientConfig.events || []
+      const needsCustomerType = events.includes('new') || events.includes('returning')
+      const customerType = needsCustomerType
+        ? await getCustomerOrdersCount(order.email || order.contact_email, clientConfig, logger)
+        : null
 
       await sendPurchaseEvent(order, clientConfig, customerType, logger)
     } catch (err) {

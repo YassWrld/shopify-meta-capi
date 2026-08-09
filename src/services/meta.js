@@ -6,6 +6,8 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
     ? order.admin_graphql_api_id.split('/').pop()
     : String(order.id)
 
+  const enabledEvents = clientConfig.events || ['purchase', 'new', 'returning']
+
   const customEventName = customerType === 'returning'
     ? 'ReturningCustomerPurchase'
     : 'NewCustomerPurchase'
@@ -43,7 +45,9 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
     user_data:        userData,
     custom_data: {
       ...customData,
-      new_vs_returning: customerType,
+      // Only attach the classification when it was actually performed
+      // (customerType is null when no customer-type event is enabled).
+      ...(customerType ? { new_vs_returning: customerType } : {}),
     },
   }
 
@@ -57,7 +61,23 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
     custom_data:      customData,
   }
 
-  const payload = { data: [purchaseEvent, customEvent] }
+  // Build the event list from this client's enabled events. The custom event is
+  // included only when this order's outcome (new/returning) is itself enabled.
+  const data = []
+  if (enabledEvents.includes('purchase')) data.push(purchaseEvent)
+  const wantCustom =
+    (customerType === 'returning' && enabledEvents.includes('returning')) ||
+    (customerType === 'new' && enabledEvents.includes('new'))
+  if (wantCustom) data.push(customEvent)
+
+  const sentEventNames = data.map((e) => e.event_name)
+
+  if (data.length === 0) {
+    logger.info({ metaStatus: 'skipped', customerType, enabledEvents }, 'No enabled events for this order — skipping Meta call')
+    return
+  }
+
+  const payload = { data }
 
   if (clientConfig.testEventCode && clientConfig.testEventCode !== '') {
     payload.test_event_code = clientConfig.testEventCode
@@ -78,7 +98,7 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
     logger.error({
       metaStatus:         'error',
       metaHttpStatus:     response.status,
-      events:             ['Purchase', customEventName],
+      events:             sentEventNames,
       customerType,
       value:              customData.value,
       currency:           order.currency,
@@ -96,7 +116,7 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
   logger.info({
     metaStatus:         'ok',
     metaEventsReceived: responseBody.events_received,
-    events:             ['Purchase', customEventName],
+    events:             sentEventNames,
     customerType,
     value:              customData.value,
     currency:           order.currency,

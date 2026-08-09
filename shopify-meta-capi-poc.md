@@ -91,15 +91,16 @@ CLIENT_1_META_TEST_EVENT_CODE=TEST12345        # Leave empty in production
 CLIENT_1_STORE_URL=https://client-store.myshopify.com
 CLIENT_1_SHOPIFY_ADMIN_TOKEN=shpat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 CLIENT_1_SHOPIFY_STORE_DOMAIN=client-store.myshopify.com
+CLIENT_1_EVENTS=purchase,new,returning         # optional; default = all three
 ```
 
-Each client is one numbered group. `SHOPIFY_ADMIN_TOKEN` (a merchant-installed custom app token, scope `read_customers`) and `SHOPIFY_STORE_DOMAIN` power the new-vs-returning lookup (Section 7.2). Add a second client by appending a `CLIENT_2_*` block and restarting — `config/clients.js` auto-discovers it, no code change. Legacy unprefixed / `CLIENT_TWO_*` names still work. See Section 12.
+Each client is one numbered group. `SHOPIFY_ADMIN_TOKEN` (a merchant-installed custom app token, scope `read_customers`) and `SHOPIFY_STORE_DOMAIN` power the new-vs-returning lookup (Section 7.2). `CLIENT_n_EVENTS` selects which events that client emits (Section 6, "Configurable events per client"). Add a second client by appending a `CLIENT_2_*` block and restarting — `config/clients.js` auto-discovers it, no code change. Legacy unprefixed / `CLIENT_TWO_*` names still work. See Section 12.
 
 ---
 
 ## 6. Dual Event Strategy
 
-For every paid Shopify order, the service fires **two separate CAPI events** to Meta:
+By default, for every paid Shopify order the service fires **two separate CAPI events** to Meta. Which events fire is **configurable per client** — see "Configurable events per client" below.
 
 ### Event 1 — Standard `Purchase`
 The standard Meta event used by Meta's algorithm for campaign optimization, value-based bidding, and ROAS reporting. This is what Meta's ad delivery algorithm reads to optimize campaigns. Deduplicated against the browser pixel via `event_id`.
@@ -114,6 +115,25 @@ A custom event used purely for segmentation and reporting. The customer type is 
 ### Why both and not just the custom event
 
 Meta's optimization algorithm is trained on the standard `Purchase` event. Replacing it with a custom event name degrades campaign performance — Meta loses years of optimization signal. The custom event runs alongside `Purchase`, never instead of it.
+
+### Configurable events per client
+
+Each client chooses which events to emit via `CLIENT_n_EVENTS` (comma-separated) in `.env`. The three values are **independent toggles**, not a menu of mutually-exclusive choices — `new` and `returning` are the two *outcomes* of classifying one order, so enabling a toggle means "emit that event for orders of that type":
+
+| Value | Effect |
+| ----- | ------ |
+| `purchase` | send the standard `Purchase` event |
+| `new` | send `NewCustomerPurchase` **when the order is from a new customer** |
+| `returning` | send `ReturningCustomerPurchase` **when the customer is returning** |
+
+Behavior:
+- **Unset/empty → all three** (default; fully backward compatible).
+- **Neither `new` nor `returning` enabled → the Shopify customer-type lookup is skipped entirely** (no Admin API call, no `not_found` noise) — a per-client performance win.
+- **`purchase` may be disabled** (e.g. `CLIENT_n_EVENTS=returning`), but this logs a **loud startup warning** because Meta's optimization depends on the standard `Purchase` event.
+- The Purchase event's `custom_data.new_vs_returning` is included **only when classification actually ran** (i.e. a customer-type event is enabled); otherwise it is omitted rather than sent as a misleading default.
+- Unknown tokens (typos) are ignored with a startup warning.
+
+Examples: `purchase,new,returning` (default) · `purchase` (standard only, lookup skipped) · `purchase,returning` (Purchase + returning audience, skip new) · `returning` (returning custom event only, ⚠️ no Purchase).
 
 ### What this enables for marketers
 
@@ -345,7 +365,7 @@ Note `metaEventsReceived: 2` — Meta confirms receipt of both events in the sam
 
 **Purpose:** Single source of truth for client credentials. Builds the client registry from environment variables at startup and exports `getClient(slug)`.
 
-**Per-client fields** (seven): `shopifySecret`, `metaPixelId`, `metaCapiToken`, `testEventCode`, `storeUrl`, and — for the customer-type lookup — `shopifyAdminToken` and `shopifyStoreDomain`.
+**Per-client fields:** `shopifySecret`, `metaPixelId`, `metaCapiToken`, `testEventCode`, `storeUrl`, `shopifyAdminToken` and `shopifyStoreDomain` (for the customer-type lookup), plus `events` — the parsed `CLIENT_n_EVENTS` list (`['purchase','new','returning']` by default; see Section 6, "Configurable events per client"). `buildConfig` parses `EVENTS` via `parseEvents`, defaulting to all three when unset and recording any unknown tokens for startup warnings.
 
 **Auto-discovery:** clients are discovered from **numbered env groups** `CLIENT_1_*`, `CLIENT_2_*`, `CLIENT_3_*`, … There is no fixed slot count — add another numbered block to `.env` and it is picked up on the next restart. A group with **no `_SLUG` is skipped**, so a half-configured client never registers and never crashes startup. Legacy names (`CLIENT_SLUG` + unprefixed, and `CLIENT_TWO_*` / `CLIENT_THREE_*`) remain honored for backward compatibility, with numbered entries taking precedence.
 
@@ -713,6 +733,13 @@ Post-launch, Meta showed missing/incorrect new-vs-returning events. Root cause: 
 **Also changed earlier (not defects):**
 - `sendPurchaseEvent(order, clientConfig, customerType, logger)` — customer type is now passed in as a `"new"`/`"returning"` string; `custom_data.new_customer` (boolean) replaced by `custom_data.new_vs_returning` (string).
 - `config/clients.js` — numbered auto-discovery of clients (Section 7.6); added per-client `shopifyAdminToken` and `shopifyStoreDomain`.
+- **Structured logging** — the customer-type lookup logs through Pino (with a console fallback for standalone scripts) instead of ad-hoc `console.*`; each order emits a consistent 3-line trace (`Order received` → `Customer classified` → `Meta CAPI call …`) carrying `client` + `orderId`, with a `reason` field on every classification. Pino output uses level labels and ISO timestamps.
+
+**Feature — configurable events per client:**
+- `CLIENT_n_EVENTS` selects which events a client emits (`purchase`, `new`, `returning` — independent toggles; default all three). See Section 6, "Configurable events per client".
+- `webhook.js` skips the Shopify customer-type lookup when neither `new` nor `returning` is enabled.
+- `meta.js` builds the `data` array from the enabled set, omits `new_vs_returning` when classification didn't run, and skips the Meta call entirely if an order has no enabled events.
+- `index.js` warns at startup on unknown event tokens, an empty event set, or `purchase` being disabled.
 
 **Known non-issues (deliberately not "fixed"):**
 - A young store with genuinely few repeat buyers will correctly emit few/no `ReturningCustomerPurchase` events — that is accurate, not a bug.

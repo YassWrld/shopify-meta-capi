@@ -13,7 +13,35 @@
 //   - CLIENT_SLUG + unprefixed SHOPIFY_*/META_*/STORE_URL  (the first client)
 //   - CLIENT_TWO_* / CLIENT_THREE_*                         (word-prefixed)
 
+// Which CAPI events a client emits. Independent toggles:
+//   purchase  → standard Purchase event
+//   new       → NewCustomerPurchase (fires when the order is from a new customer)
+//   returning → ReturningCustomerPurchase (fires when the customer is returning)
+const VALID_EVENTS = ['purchase', 'new', 'returning']
+
+// Parse the per-client CLIENT_n_EVENTS list. Unset/empty → all three (backward
+// compatible). Unknown tokens are dropped and returned separately so startup
+// validation can warn about them.
+function parseEvents(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return { events: [...VALID_EVENTS], invalid: [] }
+  }
+  const events = []
+  const invalid = []
+  for (const token of String(raw).split(',')) {
+    const t = token.trim().toLowerCase()
+    if (!t) continue
+    if (VALID_EVENTS.includes(t)) {
+      if (!events.includes(t)) events.push(t)
+    } else if (!invalid.includes(t)) {
+      invalid.push(t)
+    }
+  }
+  return { events, invalid }
+}
+
 function buildConfig(prefix) {
+  const { events, invalid } = parseEvents(process.env[`${prefix}EVENTS`])
   return {
     shopifySecret:      process.env[`${prefix}SHOPIFY_WEBHOOK_SECRET`],
     metaPixelId:        process.env[`${prefix}META_PIXEL_ID`],
@@ -22,6 +50,8 @@ function buildConfig(prefix) {
     storeUrl:           process.env[`${prefix}STORE_URL`],
     shopifyAdminToken:  process.env[`${prefix}SHOPIFY_ADMIN_TOKEN`],
     shopifyStoreDomain: process.env[`${prefix}SHOPIFY_STORE_DOMAIN`],
+    events,                       // e.g. ['purchase','new','returning']
+    invalidEventTokens: invalid,  // unknown tokens, for startup warnings
   }
 }
 
@@ -56,4 +86,5 @@ for (const { prefix, slugKey } of legacyClients) {
 module.exports = {
   getClient: (slug) => clients[slug] || null,
   clients,
+  VALID_EVENTS,
 }

@@ -30,6 +30,17 @@ function validateClients() {
         valid = false
       }
     }
+
+    // Event-config checks — warnings only (never fatal).
+    const events = config.events || []
+    if (config.invalidEventTokens && config.invalidEventTokens.length) {
+      logger.warn({ client: slug, invalid: config.invalidEventTokens }, `Ignoring unknown event(s) in ${slug} EVENTS — valid values are: purchase, new, returning`)
+    }
+    if (events.length === 0) {
+      logger.warn({ client: slug }, `Client "${slug}" has no events enabled — it will receive webhooks but send nothing to Meta`)
+    } else if (!events.includes('purchase')) {
+      logger.warn({ client: slug, events }, `Client "${slug}" has "purchase" DISABLED — Meta's optimization relies on the standard Purchase event; only the custom event(s) will be sent`)
+    }
   }
   return valid
 }
@@ -60,5 +71,8 @@ app.listen(port, () => {
     port,
     nodeEnv: process.env.NODE_ENV,
     clients: Object.keys(clients).filter(Boolean),
+    events: Object.fromEntries(
+      Object.entries(clients).map(([slug, cfg]) => [slug, cfg.events]),
+    ),
   }, 'Server started')
 })
