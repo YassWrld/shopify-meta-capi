@@ -74,7 +74,7 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
 
   if (data.length === 0) {
     logger.info({ metaStatus: 'skipped', customerType, enabledEvents }, 'No enabled events for this order — skipping Meta call')
-    return
+    return 'skipped'
   }
 
   const payload = { data }
@@ -110,7 +110,7 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
       metaErrorUserMsg:   err.error_user_msg,
       metaFbtraceId:      err.fbtrace_id,
     }, 'Meta CAPI call failed')
-    return
+    return 'failed'
   }
 
   logger.info({
@@ -121,6 +121,8 @@ async function sendPurchaseEvent(order, clientConfig, customerType, logger) {
     value:              customData.value,
     currency:           order.currency,
   }, 'Meta CAPI call succeeded')
+
+  return 'ok'
 }
 
 module.exports = { sendPurchaseEvent }

@@ -241,3 +241,73 @@ pm2 logs shopify-meta-capi
 ```
 
 After 48 hours, compare Shopify order count to Meta Events Manager → CAPI Purchase count — they should be within 5%.
+
+---
+
+## Troubleshooting — orders missing from the logs
+
+Work down this list in order. It is arranged so each step rules out one layer.
+
+### 1. Is more than one backend answering the hostname?
+
+The single most common cause of a *steady fraction* of orders going missing — especially a clean every-other-order pattern — is round-robin across two backends, where only one of them is the process you are reading logs from. The other answers `200`, so Shopify considers delivery successful and never retries.
+
+```bash
+# Each process reports its own bootId. If these alternate between two values,
+# two different processes are serving this hostname.
+for i in $(seq 1 10); do curl -s https://capi.studio-hogo.com/webhooks/health | jq -r .bootId; done
+
+# Multiple A records = DNS round-robin
+dig +short capi.studio-hogo.com
+
+# More than one process bound to the port, or a stale deploy still running
+pm2 list
+sudo ss -lptn 'sport = :3003'
+```
+
+Expected: one bootId repeated ten times, one A record, one process.
+
+### 2. Did the request reach Nginx at all?
+
+```bash
+# Count deliveries Nginx saw today, and their status codes
+sudo grep "webhooks/jylor" /var/log/nginx/access.log | wc -l
+sudo grep "webhooks/jylor" /var/log/nginx/access.log | awk '{print $9}' | sort | uniq -c
+```
+
+- **Nginx count matches Shopify's order count, app logs are lower** → the loss is between Nginx and Node.
+- **Nginx count is also low** → the request never arrived; the problem is upstream (DNS, Shopify, or a firewall).
+
+### 3. Did it reach the app?
+
+Every request that reaches Express now logs `Webhook request arrived` *before* the body is parsed, carrying Shopify's `X-Shopify-Webhook-Id`. Every rejection after that also logs. So for any given order there are only two possibilities:
+
+| Logs show | Meaning |
+|---|---|
+| `Webhook request arrived` and nothing else | body-parse failure — look for `Request rejected before handler` |
+| `Unknown client slug` | wrong slug in the Shopify webhook URL |
+| `Invalid webhook signature` | `SHOPIFY_WEBHOOK_SECRET` doesn't match the store's signing key |
+| `No route matched` | wrong path in the Shopify webhook URL |
+| nothing at all | the request never reached this process — go back to steps 1 and 2 |
+
+```bash
+# Counters since last restart
+curl -s https://capi.studio-hogo.com/webhooks/health | jq '.counters, .byClient'
+
+# Last 50 deliveries, for reconciling against the Shopify order list
+curl -s https://capi.studio-hogo.com/webhooks/health | jq -r '.recent[] | "\(.at) \(.orderName)"'
+```
+
+### 4. Is Shopify sending them?
+
+```bash
+# Duplicate or stale subscriptions — there should be exactly one orders/paid
+curl -s -X POST "https://16059b.myshopify.com/admin/api/2026-04/graphql.json" \
+  -H "X-Shopify-Access-Token: $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ webhookSubscriptions(first:25){ edges{ node{ id topic createdAt endpoint{ __typename ... on WebhookHttpEndpoint { callbackUrl } } } } } }"}' | jq
+```
+
+Also check **Shopify Admin → Settings → Notifications → Webhooks** for a delivery-failure warning. Shopify retries a failing endpoint 19 times over 48 hours and then deletes the subscription outright.
+
+Note that `orders/paid` fires on **payment capture**, not order creation. If the store uses manual capture, an order shows as Paid in the admin only once captured — and the webhook fires then, not at checkout.

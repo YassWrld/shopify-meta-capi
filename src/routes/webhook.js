@@ -2,15 +2,18 @@ const express = require('express')
 const { getClient } = require('../../config/clients')
 const { verifyWebhookSignature, getCustomerOrdersCount } = require('../services/shopify')
 const { sendPurchaseEvent } = require('../services/meta')
+const stats = require('../services/stats')
 
 const router = express.Router()
 
 router.post('/:clientSlug/order-paid', (req, res) => {
   const { clientSlug } = req.params
+  const webhookId = req.headers['x-shopify-webhook-id']
 
   const clientConfig = getClient(clientSlug)
   if (!clientConfig) {
-    req.log.warn({ clientSlug }, 'Unknown client slug')
+    stats.bump('rejectedSlug')
+    req.log.warn({ clientSlug, webhookId }, 'Unknown client slug')
     return res.status(404).end()
   }
 
@@ -18,7 +21,8 @@ router.post('/:clientSlug/order-paid', (req, res) => {
   try {
     verifyWebhookSignature(req.rawBody, hmacHeader || '', clientConfig.shopifySecret)
   } catch {
-    req.log.warn({ client: clientSlug }, 'Invalid webhook signature')
+    stats.bump('rejectedHmac', clientSlug)
+    req.log.warn({ client: clientSlug, webhookId, hasHmac: Boolean(hmacHeader) }, 'Invalid webhook signature')
     return res.status(401).end()
   }
 
@@ -30,9 +34,19 @@ router.post('/:clientSlug/order-paid', (req, res) => {
     : String(order.id)
   const eventId = 'shopify_' + orderId
 
+  stats.bump('accepted', clientSlug)
+  stats.remember({
+    at: new Date().toISOString(),
+    client: clientSlug,
+    webhookId,
+    orderId,
+    orderName: order.name,
+  })
+
   const logger = req.log.child({
     client: clientSlug,
     orderId,
+    webhookId,
   })
 
   ;(async () => {
@@ -57,8 +71,12 @@ router.post('/:clientSlug/order-paid', (req, res) => {
         ? await getCustomerOrdersCount(order.email || order.contact_email, clientConfig, logger)
         : null
 
-      await sendPurchaseEvent(order, clientConfig, customerType, logger)
+      const outcome = await sendPurchaseEvent(order, clientConfig, customerType, logger)
+      // 'skipped' is a configuration choice, not a delivery failure — don't count it as either.
+      if (outcome === 'ok') stats.bump('metaOk', clientSlug)
+      else if (outcome !== 'skipped') stats.bump('metaFailed', clientSlug)
     } catch (err) {
+      stats.bump('metaFailed', clientSlug)
       logger.error({ err }, 'Unexpected error processing order')
     }
   })()

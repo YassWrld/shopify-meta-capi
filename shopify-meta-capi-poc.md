@@ -58,7 +58,7 @@ shopify-meta-capi/
 │   │   ├── meta.js                  # CAPI payload construction + HTTP calls (two events)
 │   │   └── hash.js                  # SHA-256 normalization and hashing of PII fields
 │   └── middleware/
-│       └── rawBody.js               # Captures raw body buffer before JSON parsing
+│       └── rawBody.js               # Placeholder — raw body is captured by express.json({verify}) in index.js
 │
 ├── config/
 │   └── clients.js                   # Client credentials loaded from environment
@@ -94,7 +94,7 @@ CLIENT_1_SHOPIFY_STORE_DOMAIN=client-store.myshopify.com
 CLIENT_1_EVENTS=purchase,new,returning         # optional; default = all three
 ```
 
-Each client is one numbered group. `SHOPIFY_ADMIN_TOKEN` (a merchant-installed custom app token, scope `read_customers`) and `SHOPIFY_STORE_DOMAIN` power the new-vs-returning lookup (Section 7.2). `CLIENT_n_EVENTS` selects which events that client emits (Section 6, "Configurable events per client"). Add a second client by appending a `CLIENT_2_*` block and restarting — `config/clients.js` auto-discovers it, no code change. Legacy unprefixed / `CLIENT_TWO_*` names still work. See Section 12.
+Each client is one numbered group. `SHOPIFY_ADMIN_TOKEN` (a merchant-installed custom app token, scope `read_customers`) and `SHOPIFY_STORE_DOMAIN` power the new-vs-returning lookup (Section 7.2). `CLIENT_n_EVENTS` selects which events that client emits (Section 6, "Configurable events per client"). Add a second client by appending a `CLIENT_2_*` block and restarting — `config/clients.js` auto-discovers it, no code change. Legacy unprefixed / `CLIENT_TWO_*` names still work. See Section 13.
 
 ---
 
@@ -152,15 +152,19 @@ Examples: `purchase,new,returning` (default) · `purchase` (standard only, looku
 
 **Purpose:** Express automatically parses the JSON request body and discards the raw bytes. Shopify computes the webhook signature against the exact raw bytes of the body — not the parsed object. Without the raw body, signature verification is impossible.
 
-**Behavior:**
-- Intercepts the request stream before any body parsing
-- Collects all chunks into a buffer
-- Attaches the buffer to `req.rawBody`
-- Calls `next()` — Express JSON parsing proceeds normally afterward
+**Where it actually lives:** the raw body is captured by the `verify` callback of `express.json()` in `src/index.js`, not by a standalone middleware — that guarantees the buffer is attached on the same pass as parsing:
 
-**Applied to:** All routes globally on app startup. Must be registered before `express.json()`.
+```js
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf }
+}))
+```
 
-**Critical note:** This middleware must use the `verify` option of `express.json()` rather than being a separate middleware, to guarantee the raw body is captured on the same pass as parsing.
+**Behavior:** `verify` receives the raw buffer before parsing completes and attaches it to `req.rawBody`; the route then hands that buffer to `verifyWebhookSignature`.
+
+**Applied to:** All routes globally on app startup, registered before the `/webhooks` router.
+
+> The file `src/middleware/rawBody.js` is retained as a structural placeholder only — it contains a comment pointing at `src/index.js` and exports nothing. Do not reintroduce a separate body-collecting middleware: running it alongside `express.json()` would consume the stream twice.
 
 ---
 
@@ -180,7 +184,7 @@ Examples: `purchase,new,returning` (default) · `purchase` (standard only, looku
 
 > `crypto.timingSafeEqual` requires both buffers to be the same length. Convert both strings to `Buffer.from(str)` before comparing — if lengths differ, reject immediately without calling `timingSafeEqual`.
 
-**Exported function:** `getCustomerOrdersCount(email, clientConfig)` — determines whether the buyer is `"new"` or `"returning"` via the Shopify Admin GraphQL API. Returns the string `"new"` or `"returning"` directly (never the raw count), and **never throws** — every failure path falls back to `"new"`.
+**Exported function:** `getCustomerOrdersCount(email, clientConfig, logger)` — determines whether the buyer is `"new"` or `"returning"` via the Shopify Admin GraphQL API. Returns the string `"new"` or `"returning"` directly (never the raw count), and **never throws** — every failure path falls back to `"new"`. The `logger` argument is the route's Pino child logger (already carrying `client` + `orderId`); when omitted, the function falls back to a small `console.*` shim so standalone diagnostic scripts still log sensibly.
 
 **How it works:**
 - POSTs to `https://{shopifyStoreDomain}/admin/api/2026-04/graphql.json` with header `X-Shopify-Access-Token: {shopifyAdminToken}`.
@@ -247,11 +251,13 @@ user_data: {
   ct:                   hash(order.billing_address.city)
   st:                   hash(order.billing_address.province_code)  ← state/province, lowercase
   zp:                   hash(order.billing_address.zip)
-  country:              hash(order.billing_address.country_code.toLowerCase())
+  country:              hash(order.billing_address.country_code)  ← lowercased inside hash.js
   client_ip_address:    order.browser_ip                 ← not hashed
   client_user_agent:    order.client_details?.user_agent ← not hashed
 }
 ```
+
+Normalization (lowercase/trim/strip) happens inside `hash.js`, so the caller passes raw payload values. **Every key whose value is `null`/`undefined` is deleted before send** — Meta flags empty hashes as invalid, so an absent field must be genuinely absent from the object, not present-and-null. `billing_address` defaults to `{}` when the order has none.
 
 **Event 1 payload — standard Purchase:**
 ```
@@ -291,20 +297,23 @@ user_data: {
 **Both events are sent in a single API call** — Meta's CAPI endpoint accepts an array of up to 1000 events per request. Send them together in the `data` array rather than two separate HTTP calls:
 
 ```
-POST https://graph.facebook.com/v21.0/{pixelId}/events
+POST https://graph.facebook.com/v21.0/{pixelId}/events?access_token={capiToken}
 body: {
   data: [ event1_Purchase, event2_CustomerType ],
-  access_token: capiToken,
   test_event_code: ...   ← only if non-empty
 }
 ```
 
-**Authentication:** Access token passed as body field or query parameter `access_token={capiToken}`.
+**Which events land in `data`** — assembled from `clientConfig.events` (Section 6), not fixed at two:
+- `purchase` enabled → the Purchase event is pushed.
+- The custom event is pushed only when **this order's outcome** is enabled: `customerType === 'returning'` with `returning` on, or `customerType === 'new'` with `new` on. A `null` customerType (classification skipped) matches neither, so no custom event.
+- If `data` ends up **empty**, no HTTP call is made at all — it logs `metaStatus: "skipped"` with the client's enabled set and returns.
+
+**Authentication:** access token passed as the `access_token` query parameter (not a body field).
 
 **Response handling:**
-- Log the full response body regardless of status
-- On HTTP 4xx/5xx, log the error detail from Meta's response (`error.message`, `error.code`)
-- Do not throw — a failed CAPI call must not crash the service or affect the 200 already sent to Shopify
+- Parse the JSON response and log it on every path — `events_received` and the sent event names on success, Meta's error detail on failure (`error.message`, `code`, `error_subcode`, `type`, `error_user_title`, `error_user_msg`, `fbtrace_id`) alongside `metaHttpStatus`
+- Do not throw — a failed CAPI call must not crash the service or affect the 200 already sent to Shopify. There is no retry (see Section 14).
 
 **test_event_code behavior:** Include the field only when `clientConfig.testEventCode` is a non-empty string. In production this field must be fully absent — not `null`, not `""`.
 
@@ -327,37 +336,34 @@ body: {
 4. Respond 200 OK immediately
    ← Shopify considers the webhook delivered at this point
 5. Parse req.body (already parsed by Express, use as-is)
-6. In an async IIFE (do not await inline):
-   a. customerType = await getCustomerOrdersCount(order.email || order.contact_email, clientConfig)
+6. Extract orderId (admin_graphql_api_id → fallback String(order.id)) and build a Pino
+   child logger bound to { client, orderId } — every subsequent line carries both
+7. In an async IIFE (do not await inline):
+   a. Log "Order received" — total, currency, customer IP, user agent, eventId,
+      isTest, order name, source name, hasEmail (boolean, never the address itself)
+   b. If the client enables `new` or `returning`:
+        customerType = await getCustomerOrdersCount(order.email || order.contact_email, clientConfig, logger)
+      Otherwise customerType = null and no Admin API call is made.
       → email fallback is required for guest checkouts (see 7.2); the call never throws and is bounded by a 3s timeout
-   b. Log: order received — slug, order ID, order total, currency, customer IP, customer type
    c. Call meta.sendPurchaseEvent(order, clientConfig, customerType, logger)
    → Wrap in try/catch, log any unexpected errors. Because the lookup is timeout-bounded and always resolves, it can never block or drop the Meta send.
 ```
 
+Note the ordering: "Order received" is logged **before** classification, so it does not carry `customerType` — that appears on the separate "Customer classified" line (see 12.2).
+
 **Why respond 200 before the Meta call:** Shopify has a 5-second response timeout. If your endpoint exceeds it, Shopify marks the delivery as failed and retries — sending the same order to Meta twice. Always acknowledge Shopify first, process Meta asynchronously.
 
-**What to log (structured JSON via Pino):**
+**What to log (structured JSON via Pino):** three lines per order, not one — `client` and `orderId` come from the child logger and appear on all of them. Full sample output in Section 12.2.
 
-```json
-{
-  "level": "info",
-  "client": "studio-hogo-client1",
-  "orderId": "12345678",
-  "orderTotal": "89.99",
-  "currency": "EUR",
-  "customerIp": "82.45.12.200",
-  "customerType": "new",
-  "eventId": "shopify_12345678",
-  "metaStatus": "ok",
-  "metaEventsReceived": 2,
-  "time": "2026-04-28T14:32:00.000Z"
-}
-```
+| Line | Emitted by | Key fields |
+| ---- | ---------- | ---------- |
+| `Order received` | `webhook.js` | `orderTotal`, `currency`, `customerIp`, `userAgent`, `eventId`, `isTest`, `orderName`, `sourceName`, `hasEmail` |
+| `Customer classified` (or a `Customer lookup …` warn/error) | `shopify.js` | `store`, `reason`, `records`, `totalOrders`, `customerType` — skipped entirely when no customer-type event is enabled |
+| `Meta CAPI call succeeded` / `failed` / `skipped` | `meta.js` | `metaStatus`, `metaEventsReceived`, `events`, `customerType`, `value`, `currency` — plus `metaHttpStatus` and `metaError*` detail on failure |
 
-Note `metaEventsReceived: 2` — Meta confirms receipt of both events in the same response.
+`metaEventsReceived: 2` confirms Meta received both events in the same response.
 
-**What never appears in logs:** Email, phone, name, address, or any raw PII. Only order ID, total, currency, IP, customer type, and Meta response metadata.
+**What never appears in logs:** Email, phone, name, address, or any raw PII. The email is reduced to the boolean `hasEmail` — only order ID, total, currency, IP, user agent, customer type, and Meta response metadata are recorded.
 
 ---
 
@@ -370,7 +376,10 @@ Note `metaEventsReceived: 2` — Meta confirms receipt of both events in the sam
 **Auto-discovery:** clients are discovered from **numbered env groups** `CLIENT_1_*`, `CLIENT_2_*`, `CLIENT_3_*`, … There is no fixed slot count — add another numbered block to `.env` and it is picked up on the next restart. A group with **no `_SLUG` is skipped**, so a half-configured client never registers and never crashes startup. Legacy names (`CLIENT_SLUG` + unprefixed, and `CLIENT_TWO_*` / `CLIENT_THREE_*`) remain honored for backward compatibility, with numbered entries taking precedence.
 
 ```js
+const VALID_EVENTS = ['purchase', 'new', 'returning']
+
 function buildConfig(prefix) {
+  const { events, invalid } = parseEvents(process.env[`${prefix}EVENTS`])  // unset → all three
   return {
     shopifySecret:      process.env[`${prefix}SHOPIFY_WEBHOOK_SECRET`],
     metaPixelId:        process.env[`${prefix}META_PIXEL_ID`],
@@ -379,6 +388,8 @@ function buildConfig(prefix) {
     storeUrl:           process.env[`${prefix}STORE_URL`],
     shopifyAdminToken:  process.env[`${prefix}SHOPIFY_ADMIN_TOKEN`],
     shopifyStoreDomain: process.env[`${prefix}SHOPIFY_STORE_DOMAIN`],
+    events,                       // parsed CLIENT_n_EVENTS; defaults to all three
+    invalidEventTokens: invalid,  // unknown tokens, surfaced as startup warnings
   }
 }
 
@@ -395,7 +406,7 @@ Object.keys(process.env)
   })
 // (legacy CLIENT_SLUG / CLIENT_TWO_ / CLIENT_THREE_ also honored — see source)
 
-module.exports = { getClient: (slug) => clients[slug] || null, clients }
+module.exports = { getClient: (slug) => clients[slug] || null, clients, VALID_EVENTS }
 ```
 
 No file watching, no database. Adding a client is `.env`-only; **restart required** to pick it up — acceptable for POC scale. This flat pattern holds to ~5–6 clients before credentials should move to a database.
@@ -407,13 +418,17 @@ No file watching, no database. Adding a client is `.env`-only; **restart require
 **Purpose:** Application entry point. Wires everything together and starts the server.
 
 **Responsibilities:**
-- Register raw body middleware (before `express.json()`)
-- Register `express.json()` for body parsing
+- Create the Pino logger (level from `LOG_LEVEL`, level rendered as a label, ISO timestamps) and attach it to every request as `req.log`
+- Register `express.json({ verify })` — the `verify` callback captures `req.rawBody` (see 7.1)
 - Mount webhook router at `/webhooks`
-- Start listening on `process.env.PORT`
-- Log startup info: port, Node environment, registered client slugs
+- Start listening on `process.env.PORT` (default `3003`)
+- Log startup info: port, Node environment, registered client slugs, and each client's resolved event list
 
-**Startup validation:** On boot, iterate over all entries in `config/clients.js` and verify no required field is empty. If any credential is missing, log a clear error and exit with code 1. Better to fail fast on startup than to silently skip CAPI calls at runtime.
+**Startup validation (fatal):** On boot, iterate over all entries in `config/clients.js` and verify the four required fields — `shopifySecret`, `metaPixelId`, `metaCapiToken`, `storeUrl` — are non-empty. If any is missing, log the client and field, then exit with code 1. Better to fail fast on startup than to silently skip CAPI calls at runtime.
+
+> `shopifyAdminToken` / `shopifyStoreDomain` are deliberately **not** required — a client running `CLIENT_n_EVENTS=purchase` never performs the customer-type lookup and needs neither.
+
+**Startup warnings (non-fatal):** unknown tokens in `CLIENT_n_EVENTS`, a client with an empty event set (receives webhooks, sends nothing), and `purchase` being disabled (Meta's optimization depends on it). See Section 6.
 
 ---
 
@@ -427,7 +442,7 @@ Do this after the service is deployed and reachable over HTTPS.
 4. **Event:** `Order payment` — fires only when payment is confirmed. Do not use `orders/created` which fires for unpaid orders too
 5. **Format:** `JSON`
 6. **URL:** `https://capi.studio-hogo.com/webhooks/{client-slug}/order-paid`
-7. **Webhook API version:** Latest stable (e.g. `2024-04`)
+7. **Webhook API version:** Latest stable (e.g. `2026-04`). This is independent of the Admin GraphQL version pinned in `src/services/shopify.js` (currently `2026-04`) — the webhook version only shapes the `orders/paid` payload we receive.
 8. Click **Save**
 
 Shopify sends an automatic test ping on save. Expected responses:
@@ -440,7 +455,7 @@ Shopify sends an automatic test ping on save. Expected responses:
 | Connection refused | Nginx not running or wrong port        |
 
 **Get the signing secret:**
-After saving, click **Show signing key** on the webhook entry. Copy the value into `.env` as `SHOPIFY_WEBHOOK_SECRET`. Restart the service.
+After saving, click **Show signing key** on the webhook entry. Copy the value into `.env` as `CLIENT_n_SHOPIFY_WEBHOOK_SECRET` — using that client's own index. Restart the service.
 
 ---
 
@@ -448,11 +463,13 @@ After saving, click **Show signing key** on the webhook entry. Copy the value in
 
 ### 9.1 Collect credentials
 
-| Item              | Where                                                        | Goes into                        |
-| ----------------- | ------------------------------------------------------------ | -------------------------------- |
-| Pixel ID          | Events Manager → Data Sources → your pixel                   | `META_PIXEL_ID` in `.env`        |
-| CAPI Access Token | Events Manager → Settings → Conversions API → Generate token | `META_CAPI_TOKEN` in `.env`      |
-| Test Event Code   | Events Manager → Test Events tab                             | `META_TEST_EVENT_CODE` in `.env` |
+All three are per-client — substitute the client's index for `n`:
+
+| Item              | Where                                                        | Goes into                                 |
+| ----------------- | ------------------------------------------------------------ | ----------------------------------------- |
+| Pixel ID          | Events Manager → Data Sources → your pixel                   | `CLIENT_n_META_PIXEL_ID` in `.env`        |
+| CAPI Access Token | Events Manager → Settings → Conversions API → Generate token | `CLIENT_n_META_CAPI_TOKEN` in `.env`      |
+| Test Event Code   | Events Manager → Test Events tab                             | `CLIENT_n_META_TEST_EVENT_CODE` in `.env` |
 
 ### 9.2 Generate the CAPI Access Token
 
@@ -564,10 +581,12 @@ pm2 save
 pm2 logs shopify-meta-capi --lines 20
 ```
 
-Expected startup log:
+Expected startup log (the `events` map echoes each client's resolved `CLIENT_n_EVENTS`, so a misconfigured list is visible on boot):
 ```json
-{"port":"3003","nodeEnv":"production","clients":["jylor"],"msg":"Server started"}
+{"level":"info","time":"2026-04-28T14:30:00.000Z","port":"3003","nodeEnv":"production","clients":["jylor"],"events":{"jylor":["purchase","new","returning"]},"msg":"Server started"}
 ```
+
+Any unknown event token, an empty event set, or `purchase` being disabled emits a `warn` line just above this one (see Section 6).
 
 ### 11.4 Nginx
 
@@ -622,21 +641,29 @@ curl -X POST https://capi.studio-hogo.com/webhooks/jylor/order-paid \
 
 ### 12.1 What to verify in Meta Test Events
 
-With `META_TEST_EVENT_CODE` set, place a test order. In Meta Events Manager → Test Events tab, you should see **two events** appear for the same order:
+With `META_TEST_EVENT_CODE` set, place a test order. In Meta Events Manager → Test Events tab, you should see **two events** appear for the same order (assuming the client's `CLIENT_n_EVENTS` leaves both enabled):
 
-| Event                                                | event_id format           | Expected                                                |
-| ---------------------------------------------------- | ------------------------- | ------------------------------------------------------- |
-| `Purchase`                                           | `shopify_12345678`        | value, currency, hashed user_data, new_customer boolean |
-| `NewCustomerPurchase` or `ReturningCustomerPurchase` | `shopify_custom_12345678` | value, currency, hashed user_data                       |
+| Event                                                | event_id format           | Expected                                                                       |
+| ---------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------ |
+| `Purchase`                                           | `shopify_12345678`        | value, currency, hashed user_data, `new_vs_returning: "new" \| "returning"` * |
+| `NewCustomerPurchase` or `ReturningCustomerPurchase` | `shopify_custom_12345678` | value, currency, hashed user_data                                              |
+
+\* `new_vs_returning` is a **string**, not the old `new_customer` boolean, and is present only when classification actually ran — i.e. when `new` or `returning` is enabled for the client. With `CLIENT_n_EVENTS=purchase` the lookup is skipped, only one event appears, and the field is absent by design.
 
 ### 12.2 What to verify in logs
 
+Every order emits a consistent **3-line trace**, each line carrying `client` + `orderId` from the route's child logger:
+
 ```json
-{"msg":"Order received", "client":"jylor", "orderId":"...", "customerType":"new", ...}
-{"msg":"Meta CAPI call succeeded", "metaEventsReceived": 2, ...}
+{"level":"info","msg":"Order received","client":"jylor","orderId":"...","orderTotal":"89.99","currency":"EUR","eventId":"shopify_...","isTest":false,"hasEmail":true}
+{"level":"info","msg":"Customer classified","client":"jylor","orderId":"...","reason":"ok","records":1,"totalOrders":3,"customerType":"returning"}
+{"level":"info","msg":"Meta CAPI call succeeded","client":"jylor","orderId":"...","metaEventsReceived":2,"events":["Purchase","ReturningCustomerPurchase"],"customerType":"returning","value":89.99,"currency":"EUR"}
 ```
 
-`metaEventsReceived: 2` confirms Meta received both events in the same call.
+- `metaEventsReceived: 2` confirms Meta received both events in the same call; `events` names exactly what was sent.
+- The middle line is **absent** when the client has neither `new` nor `returning` enabled — the lookup is skipped entirely.
+- Its `reason` field is the diagnostic: `ok` / `not_found` are genuine classifications; `timeout`, `http_error`, `throttled`, `graphql_error`, `malformed_response`, `non_numeric_count`, `missing_email` are failures that fell back to `"new"` and log at `warn`/`error`. Grep `reason` to measure misclassification.
+- A failed send logs `Meta CAPI call failed` at `error` with `metaHttpStatus` and the `metaError*` detail fields from Meta's response.
 
 ### 12.3 Deduplication check
 
@@ -648,7 +675,7 @@ After adding the `eventID` to the browser pixel, place a test order and confirm 
 
 ```bash
 nano .env
-# META_TEST_EVENT_CODE=   ← empty
+# CLIENT_n_META_TEST_EVENT_CODE=   ← empty, for the client going live
 
 pm2 restart shopify-meta-capi
 ```
@@ -659,29 +686,38 @@ Monitor for 48 hours. After 48 hours compare Shopify order count to Meta CAPI `P
 
 ## 13. Scaling to Additional Clients
 
-**1. Add credentials to `.env`:**
+Adding a client is **`.env`-only**. `config/clients.js` auto-discovers numbered groups (Section 7.6), so no code change is required — take the next free index and restart.
+
+**1. Append a numbered block to `.env`** (here the fourth client — use whatever index is next):
 
 ```bash
-CLIENT_TWO_SLUG=client-two
-CLIENT_TWO_SHOPIFY_SECRET=...
-CLIENT_TWO_META_PIXEL_ID=...
-CLIENT_TWO_META_CAPI_TOKEN=...
-CLIENT_TWO_TEST_EVENT_CODE=
-CLIENT_TWO_STORE_URL=https://client-two.com
+CLIENT_4_SLUG=client-four
+CLIENT_4_SHOPIFY_WEBHOOK_SECRET=            # filled in at step 4
+CLIENT_4_META_PIXEL_ID=...
+CLIENT_4_META_CAPI_TOKEN=...
+CLIENT_4_META_TEST_EVENT_CODE=TEST12345     # empty for production
+CLIENT_4_STORE_URL=https://client-four.com
+CLIENT_4_SHOPIFY_ADMIN_TOKEN=shpat_...      # custom app, scope read_customers
+CLIENT_4_SHOPIFY_STORE_DOMAIN=client-four.myshopify.com
+CLIENT_4_EVENTS=purchase,new,returning      # optional; omit for all three
 ```
 
-**2. Extend `config/clients.js`** with a new entry block.
+`SHOPIFY_ADMIN_TOKEN` / `SHOPIFY_STORE_DOMAIN` are only needed if `new` or `returning` is enabled — with `CLIENT_n_EVENTS=purchase` the customer-type lookup never runs.
 
-**3. Restart:** `pm2 restart shopify-meta-capi`
+**2. Restart:** `pm2 restart shopify-meta-capi` — confirm the new slug and its resolved event list appear in the `Server started` log.
 
-**4. Create Shopify webhook** pointing to:
+**3. Create the Shopify webhook** (Section 8) pointing to:
 ```
-https://capi.studio-hogo.com/webhooks/client-two/order-paid
+https://capi.studio-hogo.com/webhooks/client-four/order-paid
 ```
 
-**5. Copy signing secret into `.env`, restart, run test flow.**
+**4. Copy the signing secret** from Shopify into `CLIENT_4_SHOPIFY_WEBHOOK_SECRET`, restart again, then run the test flow (Section 12).
 
-The dual event logic (`Purchase` + customer type custom event) applies automatically to all clients — no per-client configuration needed.
+Startup validation is fail-fast: a missing `shopifySecret`, `metaPixelId`, `metaCapiToken`, or `storeUrl` on **any** client logs the offending field and exits `1`. A numbered group with no `_SLUG` is skipped silently, so a half-filled block can't take the service down.
+
+The dual event logic (`Purchase` + customer type custom event) applies to every client by default; narrow it per client with `CLIENT_n_EVENTS` (Section 6).
+
+> Legacy variable names (`CLIENT_SLUG` + unprefixed, and `CLIENT_TWO_*` / `CLIENT_THREE_*`) are still honored for existing deployments, with numbered entries winning on slug collision. New clients should use the numbered convention.
 
 ### Natural limit of this approach
 
